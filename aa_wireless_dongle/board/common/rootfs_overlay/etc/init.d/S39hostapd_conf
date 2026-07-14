@@ -25,6 +25,11 @@ case "$1" in
 		if [ -n "${AAWG_COUNTRY_CODE}" ]; then
 			echo "country_code=${AAWG_COUNTRY_CODE}" >> /var/run/hostapd.conf
 		fi
+
+		# Override Wifi channel if set
+		if [ -n "${AAWG_WIFI_CHANNEL}" ]; then
+			sed -i "s/^channel=.*/channel=${AAWG_WIFI_CHANNEL}/" /var/run/hostapd.conf
+		fi
 		;;
 	*)
 		echo "Usage: $0 {start}"

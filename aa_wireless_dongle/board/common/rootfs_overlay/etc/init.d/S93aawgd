@@ -17,7 +17,8 @@ case "$1" in
 		fi
 
 		printf "Starting $DAEMON: "
-		start-stop-daemon -S -b -q -m -p "$PIDFILE" -x "/usr/bin/$DAEMON"
+		# Run under the supervisor so a crashed daemon restarts in seconds
+		start-stop-daemon -S -b -q -m -p "$PIDFILE" -x "/usr/bin/aawgd-supervise"
 		RETVAL=$?
 		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
 		;;
@@ -25,6 +26,7 @@ case "$1" in
 		printf "Stopping $DAEMON: "
 		start-stop-daemon -K -q -p "$PIDFILE"
 		RETVAL=$?
+		killall -q "$DAEMON"
 		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
 		;;
 	restart)

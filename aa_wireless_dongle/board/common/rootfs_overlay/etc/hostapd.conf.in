@@ -4,6 +4,9 @@ interface=wlan0
 hw_mode=g
 ieee80211n=1
 channel=6
+# WMM is required for 802.11n high-throughput rates; without it the link
+# falls back to slow legacy rates
+wmm_enabled=1
 
 auth_algs=1
 wpa=2

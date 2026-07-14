@@ -14,6 +14,8 @@ iface wlan0 inet static
   address 10.0.0.1
   netmask 255.255.255.0
   pre-up hostapd -B /var/run/hostapd.conf -t -f /var/log/hostapd
+  # Wifi power save causes latency spikes and dropouts on the shared Broadcom radio
+  post-up iw dev wlan0 set power_save off || true
   #post-up dnsmasq
   #pre-down killall -q dnsmasq
   post-down killall -q hostapd

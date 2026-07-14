@@ -1,0 +1,11 @@
+#!/bin/sh
+#
+# Supervise aawgd: restart it if it ever crashes or exits, so a daemon failure
+# recovers in seconds instead of staying dead until the dongle loses power.
+#
+
+while true; do
+	/usr/bin/aawgd
+	echo "aawgd exited with status $?, restarting in 3 seconds" | logger -t aawgd-supervise
+	sleep 3
+done

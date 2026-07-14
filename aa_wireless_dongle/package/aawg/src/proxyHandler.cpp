@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/poll.h>
 #include <thread>
@@ -27,6 +28,23 @@ ssize_t AAWProxy::readFully(int fd, unsigned char *buffer, size_t nbyte) {
 
         if (len <= 0) {
             // Error, cannot read more.
+            return len;
+        }
+
+        buffer += len;
+        remaining_bytes -= len;
+    }
+
+    return nbyte;
+}
+
+ssize_t AAWProxy::writeFully(int fd, unsigned char *buffer, size_t nbyte) {
+    size_t remaining_bytes = nbyte;
+    while (remaining_bytes > 0) {
+        ssize_t len = write(fd, buffer, remaining_bytes);
+
+        if (len <= 0) {
+            // Error, cannot write more. Partial writes are handled by retrying above.
             return len;
         }
 
@@ -117,7 +135,7 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
         }
 
         // Write
-        ssize_t wlen = write(write_fd, buffer, len);
+        ssize_t wlen = writeFully(write_fd, buffer, len);
 
         if (wlen <= 0) {
             // Start logging read/write details if there is an error.
@@ -180,15 +198,46 @@ void AAWProxy::handleClient(int server_sock) {
         return;
     }
 
-    // Set timeout on the TCP socket
+    // Set timeouts on the TCP socket.
+    // Generous enough to ride out brief wifi stalls instead of tearing the session down,
+    // short enough that a dead link is still detected in reasonable time.
     struct timeval tv = {
-        .tv_sec = 10,
+        .tv_sec = 30,
         .tv_usec = 0,
     };
 
     if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) {
         Logger::instance()->info("setsockopt failed: %s\n", strerror(errno));
         return;
+    }
+
+    if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv))) {
+        Logger::instance()->info("setsockopt SO_SNDTIMEO failed: %s\n", strerror(errno));
+    }
+
+    // Forward small latency-critical packets immediately
+    int enable = 1;
+    if (setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable))) {
+        Logger::instance()->info("setsockopt TCP_NODELAY failed: %s\n", strerror(errno));
+    }
+
+    // A dropped wireless link often raises no socket error, leaving the proxy waiting
+    // forever on a dead connection. Keepalives make the kernel detect this within ~30s
+    // so the reconnection logic can run.
+    if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable))) {
+        Logger::instance()->info("setsockopt SO_KEEPALIVE failed: %s\n", strerror(errno));
+    }
+
+    int keepidle = 10;
+    int keepintvl = 5;
+    int keepcnt = 3;
+    setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
+    unsigned int user_timeout_ms = 30000;
+    if (setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms))) {
+        Logger::instance()->info("setsockopt TCP_USER_TIMEOUT failed: %s\n", strerror(errno));
     }
 
     // Setup signal handler
