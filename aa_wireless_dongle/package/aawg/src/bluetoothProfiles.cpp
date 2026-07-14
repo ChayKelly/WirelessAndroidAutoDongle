@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <vector>
+#include <chrono>
 
 #include "common.h"
 #include "bluetoothHandler.h"
@@ -57,8 +58,11 @@ public:
         // Newer Android Auto versions do not always send handshake messages in a fixed
         // order and can interleave other messages (e.g. pings). Dispatch on message id in
         // a loop instead of aborting on anything unexpected.
+        // This runs on the DBus dispatcher thread, so bound the whole handshake with a
+        // deadline in addition to the per-read timeout.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
         bool wifiInfoSent = false;
-        for (int i = 0; i < 32; i++) {
+        for (int i = 0; i < 32 && std::chrono::steady_clock::now() < deadline; i++) {
             MessageId messageId = ReadMessage();
 
             if (messageId == MessageId::Invalid) {
@@ -80,7 +84,7 @@ public:
             }
             else if (messageId == MessageId::WifiPingRequest) {
                 // Echo the payload back as a ping response
-                SendRawMessage(MessageId::WifiPingResponse, m_lastPayload.data(), (uint16_t)m_lastPayload.size());
+                SendRawMessage(MessageId::WifiPingResponse, m_lastPayload.data(), m_lastPayload.size());
             }
             else {
                 // Informational (e.g. WifiConnectStatus) or unknown message. Log and continue.
@@ -133,36 +137,34 @@ private:
 
     void SendMessage(MessageId messageId, google::protobuf::MessageLite* message) {
         uint16_t messageSize = (uint16_t)message->ByteSizeLong();
-        uint16_t length = messageSize + 4;
-
-        unsigned char* buffer = new unsigned char[length];
-
-        uint16_t networkShort = 0;
-        networkShort = htons(messageSize);
-        memcpy(buffer, &networkShort, sizeof(networkShort));
-
-        networkShort = htons(static_cast<uint16_t>(messageId));
-        memcpy(buffer + 2, &networkShort, sizeof(networkShort));
-
-        message->SerializeToArray(buffer + 4, messageSize);
-
-        ssize_t wrote = write(m_fd, buffer, length);
-        if (wrote < 0) {
-            Logger::instance()->info("Error sending %s, messageId: %d\n", MessageName(messageId).c_str(), messageId);
-        }
-        else {
-            Logger::instance()->info("Sent %s, messageId: %d, wrote %d bytes\n", MessageName(messageId).c_str(), messageId, wrote);
-        }
-
-        delete[] buffer;
-    }
-
-    void SendRawMessage(MessageId messageId, const unsigned char* payload, uint16_t payloadLength) {
-        uint16_t length = payloadLength + 4;
+        size_t length = (size_t)messageSize + 4;
 
         std::vector<unsigned char> buffer(length);
 
-        uint16_t networkShort = htons(payloadLength);
+        uint16_t networkShort = 0;
+        networkShort = htons(messageSize);
+        memcpy(buffer.data(), &networkShort, sizeof(networkShort));
+
+        networkShort = htons(static_cast<uint16_t>(messageId));
+        memcpy(buffer.data() + 2, &networkShort, sizeof(networkShort));
+
+        message->SerializeToArray(buffer.data() + 4, messageSize);
+
+        if (!WriteFully(buffer.data(), length)) {
+            Logger::instance()->info("Error sending %s, messageId: %d\n", MessageName(messageId).c_str(), messageId);
+        }
+        else {
+            Logger::instance()->info("Sent %s, messageId: %d, wrote %d bytes\n", MessageName(messageId).c_str(), messageId, (int)length);
+        }
+    }
+
+    void SendRawMessage(MessageId messageId, const unsigned char* payload, size_t payloadLength) {
+        // Length is a size_t to avoid 16-bit overflow for payloads near 65535 bytes
+        size_t length = payloadLength + 4;
+
+        std::vector<unsigned char> buffer(length);
+
+        uint16_t networkShort = htons((uint16_t)payloadLength);
         memcpy(buffer.data(), &networkShort, sizeof(networkShort));
 
         networkShort = htons(static_cast<uint16_t>(messageId));
@@ -172,13 +174,28 @@ private:
             memcpy(buffer.data() + 4, payload, payloadLength);
         }
 
-        ssize_t wrote = write(m_fd, buffer.data(), length);
-        if (wrote < 0) {
+        if (!WriteFully(buffer.data(), length)) {
             Logger::instance()->info("Error sending %s, messageId: %d\n", MessageName(messageId).c_str(), messageId);
         }
         else {
-            Logger::instance()->info("Sent %s, messageId: %d, wrote %d bytes\n", MessageName(messageId).c_str(), messageId, wrote);
+            Logger::instance()->info("Sent %s, messageId: %d, wrote %d bytes\n", MessageName(messageId).c_str(), messageId, (int)length);
         }
+    }
+
+    bool WriteFully(const unsigned char* buffer, size_t nbyte) {
+        size_t remaining_bytes = nbyte;
+        while (remaining_bytes > 0) {
+            ssize_t len = write(m_fd, buffer, remaining_bytes);
+
+            if (len <= 0) {
+                return false;
+            }
+
+            buffer += len;
+            remaining_bytes -= len;
+        }
+
+        return true;
     }
 
     bool ReadFully(unsigned char* buffer, size_t nbyte) {

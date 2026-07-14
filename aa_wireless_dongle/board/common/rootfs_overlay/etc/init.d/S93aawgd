@@ -13,7 +13,11 @@ case "$1" in
 	start)
 		if [ -z "$AAWG_CONF_SOURCED" ]; then
 			echo "Source /etc/aawgd.conf"
+			# Export the variables so they reach the supervisor and daemon
+			# when this script is invoked directly rather than from rcS
+			set -a
 			source /etc/aawgd.conf
+			set +a
 		fi
 
 		printf "Starting $DAEMON: "

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "common.h"
 #include "bluetoothHandler.h"
@@ -9,6 +10,11 @@
 
 int main(void) {
     Logger::instance()->info("AA Wireless Dongle\n");
+
+    // Writing to a socket closed by the peer raises SIGPIPE, which kills the
+    // process by default. Ignore it so the write fails with EPIPE and the
+    // normal error handling and reconnection logic can run instead.
+    signal(SIGPIPE, SIG_IGN);
 
     // Global init
     std::optional<std::thread> ueventThread =  UeventMonitor::instance().start();

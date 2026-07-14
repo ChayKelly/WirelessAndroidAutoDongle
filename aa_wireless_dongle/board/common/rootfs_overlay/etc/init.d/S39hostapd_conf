@@ -26,9 +26,16 @@ case "$1" in
 			echo "country_code=${AAWG_COUNTRY_CODE}" >> /var/run/hostapd.conf
 		fi
 
-		# Override Wifi channel if set
+		# Override Wifi channel if set (2.4GHz channels 1-13 only)
 		if [ -n "${AAWG_WIFI_CHANNEL}" ]; then
-			sed -i "s/^channel=.*/channel=${AAWG_WIFI_CHANNEL}/" /var/run/hostapd.conf
+			case "${AAWG_WIFI_CHANNEL}" in
+				[1-9]|1[0-3])
+					sed -i "s/^channel=.*/channel=${AAWG_WIFI_CHANNEL}/" /var/run/hostapd.conf
+					;;
+				*)
+					echo "Ignoring invalid AAWG_WIFI_CHANNEL: ${AAWG_WIFI_CHANNEL}"
+					;;
+			esac
 		fi
 		;;
 	*)

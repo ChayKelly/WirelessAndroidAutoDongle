@@ -2,10 +2,27 @@
 #
 # Supervise aawgd: restart it if it ever crashes or exits, so a daemon failure
 # recovers in seconds instead of staying dead until the dongle loses power.
+# On TERM/INT, stop the child and exit so init script stop is clean.
 #
 
+CHILD_PID=0
+
+terminate() {
+	if [ "$CHILD_PID" != 0 ]; then
+		kill "$CHILD_PID" 2>/dev/null
+		wait "$CHILD_PID" 2>/dev/null
+	fi
+	exit 0
+}
+
+trap terminate TERM INT
+
 while true; do
-	/usr/bin/aawgd
+	/usr/bin/aawgd &
+	CHILD_PID=$!
+	wait "$CHILD_PID"
 	echo "aawgd exited with status $?, restarting in 3 seconds" | logger -t aawgd-supervise
-	sleep 3
+	CHILD_PID=0
+	sleep 3 &
+	wait $!
 done
