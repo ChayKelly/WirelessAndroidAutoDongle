@@ -1,0 +1,76 @@
+#!/bin/sh
+#
+# Start syslogd/klogd, logging to the persistent partition so the trace of a
+# disconnect survives the car cutting power at ignition-off. Root is read-only
+# and /var/log lives in RAM, so without this every log is wiped at shutdown and
+# a road-test failure leaves nothing to read afterwards.
+#
+# This overrides Buildroot's default S01logging. It writes everything (aawgd
+# events, aawgd-supervise restarts, and kernel wifi/usb messages via klogd) to
+# one file so a disconnect can be read as a single timeline. Pull the SD card
+# and read /persist/aawgd.log, same as editing aawgd.conf.
+#
+
+# The persist partition (mmcblk0p3) holds the log. If it did not mount, fall
+# back to RAM so logging still works, we just lose it on power loss as before.
+LOGFILE=/persist/aawgd.log
+if ! grep -q ' /persist ' /proc/mounts 2>/dev/null; then
+	LOGFILE=/var/log/messages
+fi
+
+# -O FILE   log target on the persistent partition
+# -s 20000  rotate at 20 MB
+# -b 9      keep 9 rotated files (aawgd.log.0..8), so ~200 MB total cap
+# No -D: the card is high-endurance and space is not a concern, so keep every
+# line. Repeated identical teardown lines and their timestamps show how often
+# and how fast the link is stalling, which is signal, not noise.
+SYSLOGD_ARGS="-O $LOGFILE -s 20000 -b 9"
+KLOGD_ARGS=""
+
+start() {
+	printf "Starting logging: "
+	start-stop-daemon -b -S -q -m -p /var/run/syslogd.pid \
+		--exec /sbin/syslogd -- -n $SYSLOGD_ARGS
+	status=$?
+	# klogd pipes kernel messages into syslog, so brcmfmac wifi disconnect
+	# reasons and usb gadget errors land in the same file as the aawgd events.
+	start-stop-daemon -b -S -q -m -p /var/run/klogd.pid \
+		--exec /sbin/klogd -- -n $KLOGD_ARGS
+	[ "$status" = 0 ] && echo "OK" || echo "FAIL"
+	# Incrementing boot ID on /persist. No RTC, so timestamps are boot-relative
+	# and reset every power cycle; a monotonic boot number makes the order of
+	# drives unambiguous when reading back a fortnight of logs.
+	bootid=0
+	if [ "$LOGFILE" != /var/log/messages ]; then
+		# Strip to digits so a corrupt/garbage bootcount (e.g. "1x") cannot cause
+		# a fatal arithmetic-expansion error and abort the rest of this script.
+		bootid=$(cat /persist/bootcount 2>/dev/null | tr -cd '0-9')
+		bootid=$((${bootid:-0} + 1))
+		echo "$bootid" > /persist/bootcount 2>/dev/null
+	fi
+	# Best-effort boot marker separating one drive's log from the next.
+	logger -t boot "==== boot #$bootid, uptime $(cut -d' ' -f1 /proc/uptime)s, logging to $LOGFILE ====" 2>/dev/null
+	return "$status"
+}
+
+stop() {
+	printf "Stopping logging: "
+	start-stop-daemon -K -q -p /var/run/klogd.pid
+	start-stop-daemon -K -q -p /var/run/syslogd.pid
+	echo "OK"
+}
+
+restart() {
+	stop
+	start
+}
+
+case "$1" in
+	start|stop|restart)
+		"$1";;
+	reload)
+		restart;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+esac

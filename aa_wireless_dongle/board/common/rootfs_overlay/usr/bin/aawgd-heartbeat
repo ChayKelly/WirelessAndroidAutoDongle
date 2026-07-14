@@ -1,0 +1,71 @@
+#!/bin/sh
+#
+# Periodic heartbeat + wifi telemetry, written to the persistent syslog.
+#
+# This runs OUTSIDE aawgd on purpose. If aawgd wedges on a silently dead link it
+# stops emitting its own logs, so "the log just stopped" is ambiguous: wedge, or
+# power loss? An independent heartbeat resolves that. While it keeps ticking the
+# system is alive, so a gap in aawgd/teardown lines with heartbeats still flowing
+# is a wedge; heartbeats stopping too is power loss (or a full-system hang).
+#
+# It also samples the AP-side wifi stats (signal, rate, retries) which are far
+# stronger evidence for congestion than a TCP timeout, and calls sync() each tick
+# so the last lines before the car cuts power have a good chance of reaching disk.
+#
+# Every field is best-effort: a missing tool or value logs "-" and never breaks
+# the loop.
+
+# Pick up AAWG_PROXY_PORT / an optional AAWG_HEARTBEAT_INTERVAL if configured.
+[ -r /etc/aawgd.conf ] && . /etc/aawgd.conf 2>/dev/null
+
+INTERVAL="${AAWG_HEARTBEAT_INTERVAL:-45}"
+# A nonnumeric or zero interval would make sleep fail and spin the loop into a
+# tight logger+sync storm. Force it to a positive integer, else fall back to 45s.
+case "$INTERVAL" in
+	''|*[!0-9]*) INTERVAL=45 ;;
+esac
+[ "$INTERVAL" -ge 1 ] 2>/dev/null || INTERVAL=45
+
+WLAN=wlan0
+PORT="${AAWG_PROXY_PORT:-5288}"
+
+dash() {
+	# Print $1, or "-" if it is empty.
+	if [ -n "$1" ]; then printf '%s' "$1"; else printf '-'; fi
+}
+
+while true; do
+	uptime_s=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+
+	if pidof aawgd >/dev/null 2>&1; then aawgd=up; else aawgd=DOWN; fi
+
+	# Free space on the log partition, so we can see it filling if it ever does.
+	persist_free=$(df -k /persist 2>/dev/null | awk 'NR==2 {print $4"k"}')
+
+	# Phone association + AP-side link quality. Empty station dump = no phone.
+	assoc=no
+	signal=""; txrate=""; rxrate=""; txretries=""; txfailed=""
+	dump=$(iw dev "$WLAN" station dump 2>/dev/null)
+	if [ -n "$dump" ]; then
+		assoc=yes
+		signal=$(printf '%s\n' "$dump"    | awk '/signal:/     {print $2; exit}')
+		txrate=$(printf '%s\n' "$dump"    | awk '/tx bitrate:/ {print $3; exit}')
+		rxrate=$(printf '%s\n' "$dump"    | awk '/rx bitrate:/ {print $3; exit}')
+		txretries=$(printf '%s\n' "$dump" | awk '/tx retries:/ {print $3; exit}')
+		txfailed=$(printf '%s\n' "$dump"  | awk '/tx failed:/  {print $3; exit}')
+	fi
+
+	# Established proxy connections: a strong "actively forwarding" signal.
+	# Best-effort, needs netstat; falls back to "-" if absent.
+	conns=""
+	if command -v netstat >/dev/null 2>&1; then
+		conns=$(netstat -tn 2>/dev/null | grep -c ":$PORT .*ESTABLISHED")
+	fi
+
+	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") signal=$(dash "$signal")dBm txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txretries=$(dash "$txretries") txfailed=$(dash "$txfailed") conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
+
+	# Flush so the tail survives an abrupt power cut at ignition-off.
+	sync
+
+	sleep "$INTERVAL"
+done

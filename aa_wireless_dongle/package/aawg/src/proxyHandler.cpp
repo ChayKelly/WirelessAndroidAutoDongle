@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <string.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -19,6 +20,28 @@
 
 void empty_signal_handler(int signal) {
     // Empty. We don't want to do anything but interrupt the thread.
+}
+
+// Name why a read/write ended so each teardown records which failure path fired.
+// These are transport-level symptoms, not a root-cause verdict: a timeout means
+// data stopped moving, which could be radio congestion, a weak link, or the phone
+// simply sending nothing. Read them next to the kernel wifi log (klogd) and the
+// heartbeat telemetry rather than treating the label itself as the diagnosis.
+static const char *teardownReason(int err) {
+    switch (err) {
+        case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+        case EWOULDBLOCK:
+#endif
+            // SO_RCVTIMEO/SO_SNDTIMEO expired: no data moved for 30s.
+            return "socket timeout after 30s (no data moved)";
+        case ETIMEDOUT:
+            // TCP keepalive or TCP_USER_TIMEOUT gave up: the kernel declared the
+            // connection dead (unacked data or failed keepalive probes).
+            return "connection timed out (keepalive/user-timeout)";
+        default:
+            return strerror(err);
+    }
 }
 
 ssize_t AAWProxy::readFully(int fd, unsigned char *buffer, size_t nbyte) {
@@ -114,6 +137,9 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
     while (!should_exit) {
         // Read
         ssize_t len = read_message ? readMessage(read_fd, buffer, buffer_len) : read(read_fd, buffer, buffer_len);
+        // Capture errno now, before any logging call (vsyslog) can overwrite it,
+        // so the teardown reason describes the failed read and not the logger.
+        int read_errno = errno;
 
         if (len <= 0) {
             // Start logging read/write details if there is an error.
@@ -124,10 +150,17 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
         }
 
         if (len < 0) {
-            Logger::instance()->info("Read from %s failed: %s\n", read_name.c_str(), strerror(errno));
+            // On teardown we SIGUSR1 the blocked threads to unstick them, which
+            // surfaces as EINTR. That is a coordinated stop, not a failure, so
+            // do not log it as one and drown out the real teardown reason.
+            if (read_errno == EINTR && should_exit) {
+                break;
+            }
+            Logger::instance()->info("Teardown: read from %s failed: %s\n", read_name.c_str(), teardownReason(read_errno));
             break;
         }
         else if (len == 0) {
+            Logger::instance()->info("Teardown: %s closed the connection (EOF)\n", read_name.c_str());
             break;
         }
         else if (should_exit) {
@@ -136,6 +169,7 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
 
         // Write
         ssize_t wlen = writeFully(write_fd, buffer, len);
+        int write_errno = errno;
 
         if (wlen <= 0) {
             // Start logging read/write details if there is an error.
@@ -146,7 +180,10 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
         }
 
         if (wlen < 0) {
-            Logger::instance()->info("Write to %s failed: %s\n", write_name.c_str(), strerror(errno));
+            if (write_errno == EINTR && should_exit) {
+                break;
+            }
+            Logger::instance()->info("Teardown: write to %s failed: %s\n", write_name.c_str(), teardownReason(write_errno));
             break;
         }
         else if (should_exit) {
@@ -188,6 +225,7 @@ void AAWProxy::handleClient(int server_sock) {
 
     if (Config::instance()->getConnectionStrategy() != ConnectionStrategy::USB_FIRST) {
         if (!UsbManager::instance().enableDefaultAndWaitForAccessory(std::chrono::seconds(30))) {
+            Logger::instance()->info("Teardown: usb accessory did not connect within 30s\n");
             return;
         }
     }
@@ -228,17 +266,32 @@ void AAWProxy::handleClient(int server_sock) {
         Logger::instance()->info("setsockopt SO_KEEPALIVE failed: %s\n", strerror(errno));
     }
 
+    // Log if any keepalive tuning was rejected: otherwise the logs would imply
+    // a ~30s dead-link detection the kernel never actually accepted.
     int keepidle = 10;
     int keepintvl = 5;
     int keepcnt = 3;
-    setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-    setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-    setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    if (setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle))) {
+        Logger::instance()->info("setsockopt TCP_KEEPIDLE failed: %s\n", strerror(errno));
+    }
+    if (setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl))) {
+        Logger::instance()->info("setsockopt TCP_KEEPINTVL failed: %s\n", strerror(errno));
+    }
+    if (setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt))) {
+        Logger::instance()->info("setsockopt TCP_KEEPCNT failed: %s\n", strerror(errno));
+    }
 
     unsigned int user_timeout_ms = 30000;
     if (setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms))) {
         Logger::instance()->info("setsockopt TCP_USER_TIMEOUT failed: %s\n", strerror(errno));
     }
+
+    // One line recording the timeouts we requested (any setsockopt that failed
+    // is logged individually above), so a teardown reason can be read against
+    // the settings that were meant to produce it.
+    Logger::instance()->info(
+        "Socket options requested: rcv/snd timeout %lds, keepalive idle %ds/intvl %ds/cnt %d, user timeout %ums, nodelay on\n",
+        (long)tv.tv_sec, keepidle, keepintvl, keepcnt, user_timeout_ms);
 
     // Setup signal handler
     struct sigaction sa;

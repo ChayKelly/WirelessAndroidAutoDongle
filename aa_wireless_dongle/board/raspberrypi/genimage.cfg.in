@@ -16,7 +16,10 @@ image persist.ext4 {
 		label = "persist"
 		use-mke2fs = true
 	}
-	size = 32M
+	# Holds bluetooth/seedrng state plus the persistent log (/persist/aawgd.log).
+	# 512M gives the log generous room; the extra space is empty ext4 so it
+	# compresses to almost nothing in the .img.xz, only the flash writes more.
+	size = 512M
 }
 
 

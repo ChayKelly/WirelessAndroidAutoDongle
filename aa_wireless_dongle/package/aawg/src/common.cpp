@@ -97,7 +97,10 @@ ConnectionStrategy Config::getConnectionStrategy() {
 }
 
 Logger::Logger() {
-    openlog(nullptr, LOG_PERROR | LOG_PID, LOG_USER);
+    // No LOG_PERROR: rcS pipes the daemon's stderr into logger, so LOG_PERROR
+    // would land every line in syslog twice (once via vsyslog, once via stderr).
+    // vsyslog alone reaches the persistent log; the copy was pure duplication.
+    openlog(nullptr, LOG_PID, LOG_USER);
 }
 
 Logger::~Logger() {
