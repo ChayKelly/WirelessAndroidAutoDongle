@@ -16,11 +16,26 @@ CHILD_PID=0
 #
 # A file rather than "aawgd | logger": a pipeline would make $! and wait see
 # logger instead of aawgd, losing the exit status that identifies the crash
-# (134 = SIGABRT). Falls back to /var/log if /persist did not mount, as S01logging does.
-ERRLOG=/persist/aawgd-stderr.log
-if ! grep -q ' /persist ' /proc/mounts 2>/dev/null; then
-	ERRLOG=/var/log/aawgd-stderr
-fi
+# (134 = SIGABRT).
+#
+# Capturing stderr must never become a precondition for starting the daemon. The
+# redirection on the launch line is evaluated by the shell before execve, so an
+# unopenable target means aawgd is never started at all and this loop spins
+# forever with nothing running: the precise failure this wrapper exists to
+# prevent, made permanent. Testing whether /persist is *mounted* is not enough,
+# because it can be mounted read-only, full, or the path can be a directory. So
+# probe for a target we can actually append to, and fall back to /dev/null rather
+# than risk the daemon. Losing the diagnostics is an acceptable outcome; losing
+# aawgd is not.
+pick_errlog() {
+	for candidate in /persist/aawgd-stderr.log /var/log/aawgd-stderr; do
+		if { : >> "$candidate"; } 2>/dev/null; then
+			printf '%s' "$candidate"
+			return
+		fi
+	done
+	printf '/dev/null'
+}
 
 terminate() {
 	if [ "$CHILD_PID" != 0 ]; then
@@ -33,20 +48,34 @@ terminate() {
 trap terminate TERM INT
 
 while true; do
-	# Only a few lines are written per crash, so this cap should never trigger.
-	# It is here so a tight crash loop spraying stderr cannot fill the partition
-	# and take the main log down with it.
-	size=0
-	[ -f "$ERRLOG" ] && size=$(wc -c < "$ERRLOG" 2>/dev/null)
-	case "$size" in
-		''|*[!0-9]*) size=0 ;;
-	esac
-	if [ "$size" -gt 1048576 ]; then
-		: > "$ERRLOG"
-	fi
+	# Re-probed every restart, so a partition that fills or goes read-only mid-life
+	# costs us the log rather than the daemon.
+	ERRLOG=$(pick_errlog)
 
-	# No RTC, so stamp uptime to line this file up against the syslog timeline.
-	echo "==== aawgd start, uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s ====" >> "$ERRLOG" 2>/dev/null
+	if [ "$ERRLOG" != /dev/null ]; then
+		# Between-launches truncation only. It cannot bound a live aawgd streaming
+		# to stderr; it is here so a crash loop over many restarts cannot fill the
+		# partition and take the main log down with it. Crash output is a few lines
+		# per launch, so in practice this should never fire.
+		size=0
+		[ -f "$ERRLOG" ] && size=$(wc -c < "$ERRLOG" 2>/dev/null)
+		case "$size" in
+			''|*[!0-9]*) size=0 ;;
+		esac
+		if [ "$size" -gt 1048576 ]; then
+			# Keep the tail rather than emptying the file: the newest crash is the
+			# one being diagnosed, and it is what pushed us over the limit.
+			if tail -c 262144 "$ERRLOG" > "$ERRLOG.tmp" 2>/dev/null; then
+				mv "$ERRLOG.tmp" "$ERRLOG" 2>/dev/null || : > "$ERRLOG" 2>/dev/null
+			else
+				rm -f "$ERRLOG.tmp" 2>/dev/null
+				: > "$ERRLOG" 2>/dev/null
+			fi
+		fi
+
+		# No RTC, so stamp uptime to line this file up against the syslog timeline.
+		echo "==== aawgd start, uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s ====" >> "$ERRLOG" 2>/dev/null
+	fi
 
 	/usr/bin/aawgd >> "$ERRLOG" 2>&1 &
 	CHILD_PID=$!
