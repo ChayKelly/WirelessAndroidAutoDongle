@@ -34,6 +34,13 @@ dash() {
 	if [ -n "$1" ]; then printf '%s' "$1"; else printf '-'; fi
 }
 
+# Log the raw station dump once per boot, the first time a phone is associated.
+# The 15 Jul road test came back with signal= and txretries= empty while txrate,
+# rxrate and txfailed parsed fine from the same dump, which points at brcmfmac
+# not reporting those two in AP mode rather than at the awk. One raw sample
+# settles it without another guess-and-reflash cycle.
+dumped=0
+
 while true; do
 	uptime_s=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 
@@ -45,14 +52,35 @@ while true; do
 	# Phone association + AP-side link quality. Empty station dump = no phone.
 	assoc=no
 	signal=""; txrate=""; rxrate=""; txretries=""; txfailed=""
+	rxbytes=""; txbytes=""; rxpkts=""; txpkts=""
 	dump=$(iw dev "$WLAN" station dump 2>/dev/null)
 	if [ -n "$dump" ]; then
 		assoc=yes
 		signal=$(printf '%s\n' "$dump"    | awk '/signal:/     {print $2; exit}')
+		# Fall back to the averaged figure if the instantaneous one is absent.
+		# Different field position: "signal: -45 dBm" vs "signal avg: -45 dBm".
+		if [ -z "$signal" ]; then
+			signal=$(printf '%s\n' "$dump" | awk '/signal avg:/ {print $3; exit}')
+		fi
 		txrate=$(printf '%s\n' "$dump"    | awk '/tx bitrate:/ {print $3; exit}')
 		rxrate=$(printf '%s\n' "$dump"    | awk '/rx bitrate:/ {print $3; exit}')
 		txretries=$(printf '%s\n' "$dump" | awk '/tx retries:/ {print $3; exit}')
 		txfailed=$(printf '%s\n' "$dump"  | awk '/tx failed:/  {print $3; exit}')
+		# Cumulative counters. txrate/rxrate are the rate of a single recent
+		# frame, so a low reading may just be rate control probing rather than a
+		# degraded link; differencing these across two ticks gives the throughput
+		# actually achieved in between, which is the figure worth trusting.
+		rxbytes=$(printf '%s\n' "$dump"   | awk '/rx bytes:/   {print $3; exit}')
+		txbytes=$(printf '%s\n' "$dump"   | awk '/tx bytes:/   {print $3; exit}')
+		rxpkts=$(printf '%s\n' "$dump"    | awk '/rx packets:/ {print $3; exit}')
+		txpkts=$(printf '%s\n' "$dump"    | awk '/tx packets:/ {print $3; exit}')
+
+		if [ "$dumped" = 0 ]; then
+			dumped=1
+			printf '%s\n' "$dump" | while IFS= read -r line; do
+				logger -t heartbeat-dump "$line"
+			done
+		fi
 	fi
 
 	# Established proxy connections: a strong "actively forwarding" signal.
@@ -62,7 +90,7 @@ while true; do
 		conns=$(netstat -tn 2>/dev/null | grep -c ":$PORT .*ESTABLISHED")
 	fi
 
-	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") signal=$(dash "$signal")dBm txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txretries=$(dash "$txretries") txfailed=$(dash "$txfailed") conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
+	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") signal=$(dash "$signal")dBm txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txretries=$(dash "$txretries") txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
 
 	# Flush so the tail survives an abrupt power cut at ignition-off.
 	sync

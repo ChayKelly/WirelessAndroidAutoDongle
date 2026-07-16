@@ -7,6 +7,21 @@
 
 CHILD_PID=0
 
+# aawgd logs through syslog, but an uncaught C++ exception is reported by the
+# runtime on stderr ("terminate called after throwing an instance of ...") and
+# that line is the only description of the fault. S93aawgd starts this script
+# with start-stop-daemon -b, which daemonizes and points stdio at /dev/null, so
+# without an explicit redirect the message is lost and a crash is only visible
+# as a bare exit status.
+#
+# A file rather than "aawgd | logger": a pipeline would make $! and wait see
+# logger instead of aawgd, losing the exit status that identifies the crash
+# (134 = SIGABRT). Falls back to /var/log if /persist did not mount, as S01logging does.
+ERRLOG=/persist/aawgd-stderr.log
+if ! grep -q ' /persist ' /proc/mounts 2>/dev/null; then
+	ERRLOG=/var/log/aawgd-stderr
+fi
+
 terminate() {
 	if [ "$CHILD_PID" != 0 ]; then
 		kill "$CHILD_PID" 2>/dev/null
@@ -18,10 +33,26 @@ terminate() {
 trap terminate TERM INT
 
 while true; do
-	/usr/bin/aawgd &
+	# Only a few lines are written per crash, so this cap should never trigger.
+	# It is here so a tight crash loop spraying stderr cannot fill the partition
+	# and take the main log down with it.
+	size=0
+	[ -f "$ERRLOG" ] && size=$(wc -c < "$ERRLOG" 2>/dev/null)
+	case "$size" in
+		''|*[!0-9]*) size=0 ;;
+	esac
+	if [ "$size" -gt 1048576 ]; then
+		: > "$ERRLOG"
+	fi
+
+	# No RTC, so stamp uptime to line this file up against the syslog timeline.
+	echo "==== aawgd start, uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s ====" >> "$ERRLOG" 2>/dev/null
+
+	/usr/bin/aawgd >> "$ERRLOG" 2>&1 &
 	CHILD_PID=$!
 	wait "$CHILD_PID"
-	echo "aawgd exited with status $?, restarting in 3 seconds" | logger -t aawgd-supervise
+	STATUS=$?
+	echo "aawgd exited with status $STATUS, restarting in 3 seconds" | logger -t aawgd-supervise
 	CHILD_PID=0
 	sleep 3 &
 	wait $!

@@ -3,7 +3,11 @@ interface=wlan0
 
 hw_mode=g
 ieee80211n=1
-channel=6
+# Channel 6 sits in the middle of the 2.4GHz band and is the default on a great
+# deal of consumer kit, so it is usually the most crowded of the three
+# non-overlapping channels. 1 is equivalent in every other respect. Override per
+# car with AAWG_WIFI_CHANNEL in aawgd.conf.
+channel=1
 # WMM is required for 802.11n high-throughput rates; without it the link
 # falls back to slow legacy rates
 wmm_enabled=1
