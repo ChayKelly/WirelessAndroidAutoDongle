@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <vector>
 #include <chrono>
+#include <exception>
 
 #include "common.h"
 #include "bluetoothHandler.h"
@@ -245,6 +246,28 @@ private:
 };
 #pragma endregion AAWirelessLauncher
 
+namespace {
+    // Owns a descriptor for the lifetime of a scope, so it is closed on every exit
+    // path including an exception unwinding out of the handshake.
+    class ScopedFd {
+    public:
+        explicit ScopedFd(int fd): m_fd(fd) {};
+        ~ScopedFd() {
+            if (m_fd >= 0) {
+                close(m_fd);
+            }
+        }
+
+        ScopedFd(const ScopedFd&) = delete;
+        ScopedFd& operator=(const ScopedFd&) = delete;
+
+        int get() const { return m_fd; }
+
+    private:
+        int m_fd;
+    };
+}
+
 #pragma region AAWirelessProfile
 void AAWirelessProfile::Release() {
     Logger::instance()->info("AA Wireless Release\n");
@@ -254,8 +277,37 @@ void AAWirelessProfile::NewConnection(DBus::Path path, std::shared_ptr<DBus::Fil
     Logger::instance()->info("AA Wireless NewConnection\n");
     Logger::instance()->info("Path: %s, fd: %d\n", path.c_str(), fd->descriptor());
 
-    AAWirelessLauncher(fd->descriptor()).launch();
-    Logger::instance()->info("Bluetooth launch sequence completed\n");
+    // bluez times out this DBus method call after 25 seconds and tears the profile down,
+    // while the handshake below is allowed up to 45. Blocking here made bluez log NoReply
+    // on every session, so reply immediately and hand the handshake to a worker thread.
+    // The descriptor belongs to the incoming DBus message, which closes it once this
+    // method returns, so the worker gets its own dup() to own and close.
+    int launcherFd = dup(fd->descriptor());
+    if (launcherFd < 0) {
+        Logger::instance()->info("Failed to duplicate bluetooth fd, errno: %s\n", strerror(errno));
+        return;
+    }
+
+    try {
+        std::thread([launcherFd]() {
+            ScopedFd ownedFd(launcherFd);
+
+            try {
+                AAWirelessLauncher(ownedFd.get()).launch();
+                Logger::instance()->info("Bluetooth launch sequence completed\n");
+            }
+            catch (const std::exception& e) {
+                Logger::instance()->info("Bluetooth launch sequence failed: %s\n", e.what());
+            }
+            catch (...) {
+                Logger::instance()->info("Bluetooth launch sequence failed with an unknown exception\n");
+            }
+        }).detach();
+    }
+    catch (const std::exception& e) {
+        Logger::instance()->info("Failed to start bluetooth handshake thread: %s\n", e.what());
+        close(launcherFd);
+    }
 }
 
 void AAWirelessProfile::RequestDisconnection(DBus::Path path) {
