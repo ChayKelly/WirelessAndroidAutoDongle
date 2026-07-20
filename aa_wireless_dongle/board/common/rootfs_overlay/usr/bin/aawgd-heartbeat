@@ -8,9 +8,10 @@
 # system is alive, so a gap in aawgd/teardown lines with heartbeats still flowing
 # is a wedge; heartbeats stopping too is power loss (or a full-system hang).
 #
-# It also samples the AP-side wifi stats (signal, rate, retries) which are far
-# stronger evidence for congestion than a TCP timeout, and calls sync() each tick
-# so the last lines before the car cuts power have a good chance of reaching disk.
+# It also samples the AP-side link rates and the channel survey, which are far
+# stronger evidence for congestion than a TCP timeout, and calls sync() at a
+# bounded rate so the last lines before the car cuts power have a good chance of
+# reaching disk.
 #
 # Every field is best-effort: a missing tool or value logs "-" and never breaks
 # the loop.
@@ -26,6 +27,13 @@ case "$INTERVAL" in
 esac
 [ "$INTERVAL" -ge 1 ] 2>/dev/null || INTERVAL=45
 
+# sync is decoupled from the tick rate. Diagnostic drives run the interval down
+# to 10s to make a track change visible (songs run three to four minutes, so 45s
+# cannot resolve one), and syncing every tick at that rate would be 4.5x the SD
+# card writes for no extra safety. Bounding it by elapsed time instead keeps the
+# worst-case log-tail loss where it has always been, about 45 seconds.
+SYNC_INTERVAL=45
+
 WLAN=wlan0
 PORT="${AAWG_PROXY_PORT:-5288}"
 
@@ -34,12 +42,36 @@ dash() {
 	if [ -n "$1" ]; then printf '%s' "$1"; else printf '-'; fi
 }
 
-# Log the raw station dump once per boot, the first time a phone is associated.
-# The 15 Jul road test came back with signal= and txretries= empty while txrate,
-# rxrate and txfailed parsed fine from the same dump, which points at brcmfmac
-# not reporting those two in AP mode rather than at the awk. One raw sample
-# settles it without another guess-and-reflash cycle.
+survey_field() {
+	# Print the "$1" value out of the survey block marked [in use].
+	#
+	# "survey dump" emits one block per frequency and the in-use block is not
+	# reliably first, so track which block we are inside rather than taking the
+	# first match: the other blocks are the rest of the band and carry either
+	# nothing or somebody else's numbers. Every line we want ends "<value>
+	# <unit>", hence $(NF-1). Matching $1 exactly avoids "frequency offset:".
+	printf '%s\n' "$survey" | awk -v want="$1" '
+		$1 == "frequency:" { inuse = ($0 ~ /\[in use\]/); next }
+		inuse && index($0, want) { print $(NF-1); exit }
+	'
+}
+
+# Log the raw station dump once per boot, the first time a phone is associated,
+# as the standing record of what brcmfmac actually reports in AP mode. It is
+# what settled the empty signal=/txretries= question after two road tests: the
+# driver emits neither line, so no amount of parser fallback was ever going to
+# revive them.
 dumped=0
+
+# Log the AP's channel and the regulatory domain in force, once per boot. Two
+# drives recorded neither, so channel 1 and GB have been taken on trust. Done
+# inside the loop rather than before it because wlan0 may not be up yet when
+# this script starts; it retries until there is something to report.
+configdumped=0
+
+# Uptime in whole seconds at the last sync, so the rate limit above has a clock
+# that does not depend on the tick actually taking $INTERVAL.
+last_sync=""
 
 while true; do
 	uptime_s=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
@@ -49,22 +81,30 @@ while true; do
 	# Free space on the log partition, so we can see it filling if it ever does.
 	persist_free=$(df -k /persist 2>/dev/null | awk 'NR==2 {print $4"k"}')
 
+	if [ "$configdumped" = 0 ]; then
+		wlaninfo=$(iw dev "$WLAN" info 2>/dev/null)
+		# Gate on the interface info, not on "iw reg get", which answers even
+		# with no interface up and would otherwise burn the one-shot early.
+		if [ -n "$wlaninfo" ]; then
+			configdumped=1
+			reginfo=$(iw reg get 2>/dev/null)
+			printf '%s\n' "$wlaninfo" "$reginfo" | while IFS= read -r line; do
+				if [ -n "$line" ]; then
+					logger -t heartbeat-config "$line"
+				fi
+			done
+		fi
+	fi
+
 	# Phone association + AP-side link quality. Empty station dump = no phone.
 	assoc=no
-	signal=""; txrate=""; rxrate=""; txretries=""; txfailed=""
+	txrate=""; rxrate=""; txfailed=""
 	rxbytes=""; txbytes=""; rxpkts=""; txpkts=""
 	dump=$(iw dev "$WLAN" station dump 2>/dev/null)
 	if [ -n "$dump" ]; then
 		assoc=yes
-		signal=$(printf '%s\n' "$dump"    | awk '/signal:/     {print $2; exit}')
-		# Fall back to the averaged figure if the instantaneous one is absent.
-		# Different field position: "signal: -45 dBm" vs "signal avg: -45 dBm".
-		if [ -z "$signal" ]; then
-			signal=$(printf '%s\n' "$dump" | awk '/signal avg:/ {print $3; exit}')
-		fi
 		txrate=$(printf '%s\n' "$dump"    | awk '/tx bitrate:/ {print $3; exit}')
 		rxrate=$(printf '%s\n' "$dump"    | awk '/rx bitrate:/ {print $3; exit}')
-		txretries=$(printf '%s\n' "$dump" | awk '/tx retries:/ {print $3; exit}')
 		txfailed=$(printf '%s\n' "$dump"  | awk '/tx failed:/  {print $3; exit}')
 		# Cumulative counters. txrate/rxrate are the rate of a single recent
 		# frame, so a low reading may just be rate control probing rather than a
@@ -83,6 +123,24 @@ while true; do
 		fi
 	fi
 
+	# Channel occupancy, which replaces the station RSSI and retry counters the
+	# driver never reports. This works in AP mode and measures every emitter on
+	# the channel rather than one station's link, so it is what separates a
+	# genuinely congested channel from the phone backing off on a quiet one.
+	# Logged raw, exactly like rxbytes/txbytes: these are cumulative counters,
+	# and differencing them on the analysis side keeps this loop stateless and
+	# unbothered by a counter reset. Noise is an instantaneous reading, not a
+	# counter, so it stands on its own.
+	noise=""; chactive=""; chbusy=""; chrx=""; chtx=""
+	survey=$(iw dev "$WLAN" survey dump 2>/dev/null)
+	if [ -n "$survey" ]; then
+		noise=$(survey_field 'noise:')
+		chactive=$(survey_field 'channel active time:')
+		chbusy=$(survey_field 'channel busy time:')
+		chrx=$(survey_field 'channel receive time:')
+		chtx=$(survey_field 'channel transmit time:')
+	fi
+
 	# Established proxy connections: a strong "actively forwarding" signal.
 	# Best-effort, needs netstat; falls back to "-" if absent.
 	conns=""
@@ -90,10 +148,20 @@ while true; do
 		conns=$(netstat -tn 2>/dev/null | grep -c ":$PORT .*ESTABLISHED")
 	fi
 
-	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") signal=$(dash "$signal")dBm txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txretries=$(dash "$txretries") txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
+	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") noise=$(dash "$noise")dBm chactive=$(dash "$chactive")ms chbusy=$(dash "$chbusy")ms chrx=$(dash "$chrx")ms chtx=$(dash "$chtx")ms conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
 
-	# Flush so the tail survives an abrupt power cut at ignition-off.
-	sync
+	# Flush so the tail survives an abrupt power cut at ignition-off, but no
+	# more often than SYNC_INTERVAL of elapsed time. If /proc/uptime gave us
+	# nothing there is no clock to rate limit against, so fall back to syncing
+	# every tick, which is what this did before.
+	uptime_i="${uptime_s%%.*}"
+	case "$uptime_i" in
+		''|*[!0-9]*) uptime_i='' ;;
+	esac
+	if [ -z "$uptime_i" ] || [ -z "$last_sync" ] || [ $((uptime_i - last_sync)) -ge "$SYNC_INTERVAL" ]; then
+		sync
+		last_sync="$uptime_i"
+	fi
 
 	sleep "$INTERVAL"
 done
