@@ -1,9 +1,29 @@
 #include <stdio.h>
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
 #include "common.h"
 #include "bluetoothHandler.h"
 #include "bluetoothProfiles.h"
 #include "bluetoothAdvertisement.h"
+
+// Escalation thresholds, counted in consecutive failed retry rounds 20s apart.
+//
+// A device that claims to be Connected but whose profile will not complete is stale bluez
+// state, and power cycling the controller can genuinely clear that, so escalate quickly.
+// A device that is simply not connected usually means the phone is away, asleep, or has
+// stopped accepting connections, and no amount of resetting the local controller can make
+// a remote device answer. That case escalates slowly, as a long shot rather than a fix.
+static constexpr int STALE_FAILURES_BEFORE_ADAPTER_RESET = 3;
+static constexpr int ABSENT_FAILURES_BEFORE_ADAPTER_RESET = 12;
+
+// Each reset doubles the threshold up to this ceiling (8 minutes at a 20s retry). Without
+// it, a phone left at home would power cycle the adapter every minute for the whole drive.
+static constexpr int MAX_FAILURES_BEFORE_ADAPTER_RESET = 24;
+
+static constexpr std::chrono::seconds ADAPTER_RESET_SETTLE_TIME{2};
 
 static constexpr const char* ADAPTER_ALIAS_PREFIX = "WirelessAADongle-";
 static constexpr const char* ADAPTER_ALIAS_DONGLE_PREFIX = "AndroidAuto-Dongle-";
@@ -172,7 +192,7 @@ void BluetoothHandler::stopAdvertising() {
     Logger::instance()->info("BLE Advertisement stopped\n");
 }
 
-void BluetoothHandler::connectDevice() {
+BluetoothHandler::ConnectResult BluetoothHandler::connectDevice() {
     DBus::ManagedObjects objects = getBluezObjects();
 
     std::vector<std::string> device_paths;
@@ -186,35 +206,66 @@ void BluetoothHandler::connectDevice() {
 
     if (!device_paths.size()) {
         Logger::instance()->info("Did not find any connected bluetooth device\n");
-        return;
+        return ConnectResult::NoDevices;
     }
 
     const bool isDongleMode = (Config::instance()->getConnectionStrategy() == ConnectionStrategy::DONGLE_MODE);
+    bool anyConnected = false;
+    bool anyClaimedConnected = false;
 
     Logger::instance()->info("Found %d bluetooth devices\n", device_paths.size());
 
     for (const std::string &device_path: device_paths) {
         Logger::instance()->info("Trying to connect bluetooth device at path: %s\n", device_path.c_str());
 
-        std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, device_path);
-        DBus::MethodProxy connectProfile = *(bluezDevice->create_method<void(std::string)>(INTERFACE_BLUEZ_DEVICE, "ConnectProfile"));
-        DBus::MethodProxy disconnect = *(bluezDevice->create_method<void()>(INTERFACE_BLUEZ_DEVICE, "Disconnect"));
-
-        std::shared_ptr<DBus::PropertyProxy<bool>> deviceConnected = bluezDevice->create_property<bool>(INTERFACE_BLUEZ_DEVICE, "Connected");
-
+        // Everything below is inside the try, including creating the proxies. Creating them
+        // outside it meant a throw here escaped connectDevice and killed the retry thread
+        // outright, which is precisely the thread that is supposed to recover from a stall.
         try {
+            std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, device_path);
+            DBus::MethodProxy connectProfile = *(bluezDevice->create_method<void(std::string)>(INTERFACE_BLUEZ_DEVICE, "ConnectProfile"));
+            DBus::MethodProxy disconnect = *(bluezDevice->create_method<void()>(INTERFACE_BLUEZ_DEVICE, "Disconnect"));
+
+            std::shared_ptr<DBus::PropertyProxy<bool>> deviceConnected = bluezDevice->create_property<bool>(INTERFACE_BLUEZ_DEVICE, "Connected");
+
+            // Read the property, not the proxy handle. create_property() always returns a
+            // valid pointer, so testing the pointer disconnected the device on every single
+            // attempt, including the first one after boot when nothing can be connected yet.
+            bool alreadyConnected = false;
             if (deviceConnected) {
+                try {
+                    alreadyConnected = deviceConnected->value();
+                } catch (const std::exception&) {
+                    // Treat an unreadable property as not connected and let ConnectProfile decide.
+                    alreadyConnected = false;
+                }
+            }
+
+            // Logged because it is the one fact that says whether a failure to connect is a
+            // phone that has gone away or bluez holding a device object that is already dead.
+            // No capture before now recorded it, so the escalation below is calibrated blind.
+            Logger::instance()->info("Bluetooth device reports connected=%s\n", alreadyConnected ? "yes" : "no");
+
+            if (alreadyConnected) {
+                anyClaimedConnected = true;
                 Logger::instance()->info("Bluetooth device already connected, disconnecting\n");
                 disconnect();
             }
             connectProfile(isDongleMode ? "" : HSP_AG_UUID);
             Logger::instance()->info("Bluetooth connected to the device\n");
+            anyConnected = true;
             if (!isDongleMode) {
-                return;
+                return ConnectResult::Connected;
             }
         } catch (DBus::Error& e) {
             if (!isDongleMode) {
                 Logger::instance()->info("Failed to connect device at path: %s\n", device_path.c_str());
+            }
+        } catch (const std::exception& e) {
+            // Anything that is not a DBus::Error would otherwise unwind out of the retry
+            // thread. Log and carry on to the next device instead.
+            if (!isDongleMode) {
+                Logger::instance()->info("Failed to connect device at path %s: %s\n", device_path.c_str(), e.what());
             }
         }
     }
@@ -222,14 +273,78 @@ void BluetoothHandler::connectDevice() {
     if (!isDongleMode) {
         Logger::instance()->info("Failed to connect to any known bluetooth device\n");
     }
+
+    if (anyConnected) {
+        return ConnectResult::Connected;
+    }
+
+    return anyClaimedConnected ? ConnectResult::Wedged : ConnectResult::Unreachable;
+}
+
+void BluetoothHandler::resetAdapter(int attempts) {
+    if (!m_adapter) {
+        return;
+    }
+
+    Logger::instance()->info("Bluetooth reconnect stuck after %d attempts, power cycling the adapter\n", attempts);
+
+    try {
+        setPower(false);
+        std::this_thread::sleep_for(ADAPTER_RESET_SETTLE_TIME);
+        setPower(true);
+        setPairable(true);
+    } catch (const std::exception& e) {
+        // Best effort. A failed reset must not take the retry loop down with it.
+        Logger::instance()->info("Bluetooth adapter power cycle failed: %s\n", e.what());
+    } catch (...) {
+        Logger::instance()->info("Bluetooth adapter power cycle failed with an unknown exception\n");
+    }
 }
 
 void BluetoothHandler::retryConnectLoop() {
     bool should_exit = false;
+    int consecutiveFailures = 0;
+    int staleThreshold = STALE_FAILURES_BEFORE_ADAPTER_RESET;
+    int absentThreshold = ABSENT_FAILURES_BEFORE_ADAPTER_RESET;
+    const bool isDongleMode = (Config::instance()->getConnectionStrategy() == ConnectionStrategy::DONGLE_MODE);
     std::future<void> connectWithRetryFuture = connectWithRetryPromise->get_future();
 
     while (!should_exit) {
-        connectDevice();
+        ConnectResult result = ConnectResult::NoDevices;
+
+        // connectDevice talks to bluez before it reaches its own per-device try, so a throw
+        // from getBluezObjects would unwind out of this loop and end the thread silently:
+        // no more retries, no supervisor restart, and heartbeats still saying aawgd is up.
+        try {
+            result = connectDevice();
+        } catch (const std::exception& e) {
+            Logger::instance()->info("Bluetooth connect attempt threw: %s\n", e.what());
+        } catch (...) {
+            Logger::instance()->info("Bluetooth connect attempt threw an unknown exception\n");
+        }
+
+        // Waiting for a phone to appear at all is the normal state at boot and must never
+        // trigger a reset, which is why NoDevices is not counted here.
+        int threshold = 0;
+        if (result == ConnectResult::Wedged) {
+            threshold = staleThreshold;
+        } else if (result == ConnectResult::Unreachable) {
+            threshold = absentThreshold;
+        }
+
+        if (threshold > 0 && !isDongleMode) {
+            if (++consecutiveFailures >= threshold) {
+                resetAdapter(consecutiveFailures);
+                consecutiveFailures = 0;
+
+                // Back off both thresholds, so a phone that is simply not there cannot hold
+                // the adapter in a power cycle every minute for the rest of the drive.
+                staleThreshold = std::min(staleThreshold * 2, MAX_FAILURES_BEFORE_ADAPTER_RESET);
+                absentThreshold = std::min(absentThreshold * 2, MAX_FAILURES_BEFORE_ADAPTER_RESET);
+            }
+        } else {
+            consecutiveFailures = 0;
+        }
 
         if (connectWithRetryFuture.wait_for(std::chrono::seconds(20)) == std::future_status::ready) {
             should_exit = true;

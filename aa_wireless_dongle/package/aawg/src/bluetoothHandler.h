@@ -22,6 +22,13 @@ public:
     void stopConnectWithRetry();
 
 private:
+    enum class ConnectResult {
+        NoDevices,    // nothing known to connect to yet, so nothing has failed
+        Connected,
+        Unreachable,  // known device, not connected, would not connect: phone is away or asleep
+        Wedged,       // device claims Connected but the profile will not complete: stale bluez state
+    };
+
     BluetoothHandler() {};
     BluetoothHandler(BluetoothHandler const&);
     BluetoothHandler& operator=(BluetoothHandler const&);
@@ -32,7 +39,8 @@ private:
     void setPower(bool on);
     void setPairable(bool pairable);
     void exportProfiles();
-    void connectDevice();
+    ConnectResult connectDevice();
+    void resetAdapter(int attempts);
 
     void startAdvertising();
     void stopAdvertising();
