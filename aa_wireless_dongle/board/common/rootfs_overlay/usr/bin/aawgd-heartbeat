@@ -8,10 +8,9 @@
 # system is alive, so a gap in aawgd/teardown lines with heartbeats still flowing
 # is a wedge; heartbeats stopping too is power loss (or a full-system hang).
 #
-# It also samples the AP-side link rates and the channel survey, which are far
-# stronger evidence for congestion than a TCP timeout, and calls sync() at a
-# bounded rate so the last lines before the car cuts power have a good chance of
-# reaching disk.
+# It also samples the AP-side link rates and byte counters, and calls sync() at
+# a bounded rate so the last lines before the car cuts power have a good chance
+# of reaching disk.
 #
 # Every field is best-effort: a missing tool or value logs "-" and never breaks
 # the loop.
@@ -40,20 +39,6 @@ PORT="${AAWG_PROXY_PORT:-5288}"
 dash() {
 	# Print $1, or "-" if it is empty.
 	if [ -n "$1" ]; then printf '%s' "$1"; else printf '-'; fi
-}
-
-survey_field() {
-	# Print the "$1" value out of the survey block marked [in use].
-	#
-	# "survey dump" emits one block per frequency and the in-use block is not
-	# reliably first, so track which block we are inside rather than taking the
-	# first match: the other blocks are the rest of the band and carry either
-	# nothing or somebody else's numbers. Every line we want ends "<value>
-	# <unit>", hence $(NF-1). Matching $1 exactly avoids "frequency offset:".
-	printf '%s\n' "$survey" | awk -v want="$1" '
-		$1 == "frequency:" { inuse = ($0 ~ /\[in use\]/); next }
-		inuse && index($0, want) { print $(NF-1); exit }
-	'
 }
 
 # Log the raw station dump once per boot, the first time a phone is associated,
@@ -93,6 +78,30 @@ while true; do
 					logger -t heartbeat-config "$line"
 				fi
 			done
+
+			# Channel survey, probed once per boot instead of sampled every
+			# tick. brcmfmac does not implement survey dump in AP mode, so
+			# noise/chactive/chbusy/chrx/chtx were "-" on every heartbeat of
+			# drives 3, 4 and 5, one of them at an 8s interval. That is five
+			# dead fields on every line for nothing, so they came out of the
+			# heartbeat exactly as signal= and txretries= did before them.
+			#
+			# What is left is this capability probe. Silence is the finding, so
+			# it is logged explicitly rather than logged as nothing: one line a
+			# boot says the driver still cannot do it. If a kernel or firmware
+			# update ever implements it the numbers appear here, and the
+			# per-tick fields are worth restoring at that point. It is not a
+			# measurement, so do not read the counters in it as one.
+			survey=$(iw dev "$WLAN" survey dump 2>/dev/null)
+			if [ -n "$survey" ]; then
+				printf '%s\n' "$survey" | while IFS= read -r line; do
+					if [ -n "$line" ]; then
+						logger -t heartbeat-survey "$line"
+					fi
+				done
+			else
+				logger -t heartbeat-survey "no output: survey dump not implemented by this driver in AP mode"
+			fi
 		fi
 	fi
 
@@ -123,24 +132,6 @@ while true; do
 		fi
 	fi
 
-	# Channel occupancy, which replaces the station RSSI and retry counters the
-	# driver never reports. This works in AP mode and measures every emitter on
-	# the channel rather than one station's link, so it is what separates a
-	# genuinely congested channel from the phone backing off on a quiet one.
-	# Logged raw, exactly like rxbytes/txbytes: these are cumulative counters,
-	# and differencing them on the analysis side keeps this loop stateless and
-	# unbothered by a counter reset. Noise is an instantaneous reading, not a
-	# counter, so it stands on its own.
-	noise=""; chactive=""; chbusy=""; chrx=""; chtx=""
-	survey=$(iw dev "$WLAN" survey dump 2>/dev/null)
-	if [ -n "$survey" ]; then
-		noise=$(survey_field 'noise:')
-		chactive=$(survey_field 'channel active time:')
-		chbusy=$(survey_field 'channel busy time:')
-		chrx=$(survey_field 'channel receive time:')
-		chtx=$(survey_field 'channel transmit time:')
-	fi
-
 	# Established proxy connections: a strong "actively forwarding" signal.
 	# Best-effort, needs netstat; falls back to "-" if absent.
 	conns=""
@@ -148,7 +139,7 @@ while true; do
 		conns=$(netstat -tn 2>/dev/null | grep -c ":$PORT .*ESTABLISHED")
 	fi
 
-	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") noise=$(dash "$noise")dBm chactive=$(dash "$chactive")ms chbusy=$(dash "$chbusy")ms chrx=$(dash "$chrx")ms chtx=$(dash "$chtx")ms conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
+	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
 
 	# Flush so the tail survives an abrupt power cut at ignition-off, but no
 	# more often than SYNC_INTERVAL of elapsed time. If /proc/uptime gave us
