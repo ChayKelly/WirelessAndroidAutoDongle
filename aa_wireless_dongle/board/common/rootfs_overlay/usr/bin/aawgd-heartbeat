@@ -170,7 +170,14 @@ resolve_power_paths() {
 		break
 	done
 
-	logger -t heartbeat-power "sources: temp=$(dash "$THERMAL_PATH") freq=$(dash "$FREQ_PATH") uvolt=$(dash "$UVOLT_PATH") throttled=$(dash "$THROTTLED_PATH")"
+	# One source per line. All four on one line came to 273 characters, which is
+	# exactly where BusyBox syslogd cuts, so the throttled= path lost its last
+	# character and read as get_throttle rather than get_throttled: a path that
+	# does not exist, in the one line whose whole job is to say what was found.
+	logger -t heartbeat-power "source temp=$(dash "$THERMAL_PATH")"
+	logger -t heartbeat-power "source freq=$(dash "$FREQ_PATH")"
+	logger -t heartbeat-power "source uvolt=$(dash "$UVOLT_PATH")"
+	logger -t heartbeat-power "source throttled=$(dash "$THROTTLED_PATH")"
 
 	# The trip points say where this board's firmware starts throttling, so a
 	# reader does not have to take 80C/85C on trust from a datasheet.
@@ -395,7 +402,15 @@ while true; do
 		conns=$(netstat -tn 2>/dev/null | grep -c ":$PORT .*ESTABLISHED")
 	fi
 
-	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") conns=$(dash "$conns") persistfree=$(dash "$persist_free") temp=$(dash "$temp_c")C tempmax=$(dash "$temp_max_c")C freq=$(dash "$freq_mhz")M uvolt=$(dash "$uvolt") uvoltseen=$(dash "$uvolt_seen") throttled=$(dash "$throttled")"
+	# Two lines, not one. BusyBox syslogd truncates a message at a fixed length
+	# and the single combined line had grown into that cap: on Drive 6, 83 of 248
+	# heartbeats came out at exactly 273 characters and 23 of them lost the
+	# trailing throttled= field entirely. The byte and packet counters only get
+	# longer as a drive goes on, so the tail field was going to keep being eaten.
+	# Splitting keeps each line well clear of the limit and means a missing field
+	# again reads as "not measured" rather than "ran off the end of the buffer".
+	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
+	logger -t heartbeat-tp "up=${uptime_s}s temp=$(dash "$temp_c")C tempmax=$(dash "$temp_max_c")C freq=$(dash "$freq_mhz")M uvolt=$(dash "$uvolt") uvoltseen=$(dash "$uvolt_seen") throttled=$(dash "$throttled")"
 
 	# Flush so the tail survives an abrupt power cut at ignition-off, but no
 	# more often than SYNC_INTERVAL of elapsed time. If /proc/uptime gave us
