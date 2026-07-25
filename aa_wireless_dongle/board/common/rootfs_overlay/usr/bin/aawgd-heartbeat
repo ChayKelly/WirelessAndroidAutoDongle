@@ -8,9 +8,10 @@
 # system is alive, so a gap in aawgd/teardown lines with heartbeats still flowing
 # is a wedge; heartbeats stopping too is power loss (or a full-system hang).
 #
-# It also samples the AP-side link rates and byte counters, and calls sync() at
-# a bounded rate so the last lines before the car cuts power have a good chance
-# of reaching disk.
+# It also samples the AP-side link rates and byte counters, the SoC temperature,
+# the ARM clock and the firmware's throttle/under-voltage flags, and calls sync()
+# at a bounded rate so the last lines before the car cuts power have a good
+# chance of reaching disk.
 #
 # Every field is best-effort: a missing tool or value logs "-" and never breaks
 # the loop.
@@ -58,6 +59,191 @@ configdumped=0
 # that does not depend on the tick actually taking $INTERVAL.
 last_sync=""
 
+######## Thermal and power telemetry ########
+#
+# Added 25 Jul 2026 after Chay recalled a hot afternoon where the dongle
+# rebooted repeatedly for the first ten or fifteen minutes and then held once
+# the aircon had cooled the cabin. Drives 1-5 cannot answer that: the only
+# thermal line in any of those captures is the boot-time governor registration,
+# there is no RTC so nothing can be pinned to a time of day, and neither
+# temperature nor supply voltage was ever sampled. These fields exist so the
+# next hot drive is answerable instead of a hypothesis.
+#
+# What each field can and cannot settle:
+#
+# - temp=/tempmax=  SoC temperature. Throttling starts at 80C and the ceiling
+#   is 85C, and neither is a reboot: it slows down, it does not fall over. So a
+#   high temp does not by itself explain a power cut. Two caveats worth keeping
+#   in mind before reading too much into it. This is die temperature, not cabin
+#   temperature: it moves with load, enclosure airflow and how recently the
+#   board rebooted, so it is a noisy proxy for the ambient heat the hypothesis
+#   is actually about. And "does not by itself explain" is not "cannot
+#   contribute". What it is good for is correlation: if reboots cluster while
+#   temp is high and stop as it falls, heat is implicated in whatever is
+#   marginal, most plausibly the connector or the regulator's brownout margin.
+# - freq=  ARM clock in MHz. On its own it proves nothing, because the governor
+#   idles the core at 600MHz perfectly happily; a low clock is only interesting
+#   sitting next to a high temp or a set cap bit.
+# - uvolt=/uvoltseen=  the firmware's under-voltage alarm via raspberrypi-hwmon,
+#   live and sticky-since-boot. Best onboard corroboration of a power-integrity
+#   problem, which is not the same as identifying the connector: all it says is
+#   that the local 5V rail crossed the alarm threshold. It cannot separate the
+#   connector from the cable, the head unit's supply or the Pi's own regulator.
+#   READ THE ABSENCE CAREFULLY: this is sampled state, not a latch, so a sag
+#   shorter than the tick interval is missed entirely, and a fast open-circuit
+#   reset can be over before anything is polled or flushed. `uvolt=0` all drive
+#   is therefore NOT evidence that power is fine. `uvoltseen=1` is strong
+#   positive evidence; `uvoltseen=0` is weak negative evidence. The kernel also
+#   prints "Under-voltage detected!" / "Voltage normalised" of its own accord,
+#   and klogd already puts those in the same file, which is the better record
+#   of the two because it does not depend on this loop's timing.
+# - throttled=  the firmware's throttle bitmask, if this kernel exposes it. The
+#   sticky half (bits 16-19) is the valuable part: it records that under-voltage
+#   or a frequency cap HAS happened since boot, so a spike between two ticks is
+#   still caught at 45s intervals.
+#
+# Paths are resolved once per boot rather than every tick, and what was and was
+# not found is logged explicitly as `heartbeat-power`, following the same
+# convention as `heartbeat-survey`: silence is a finding, so record it as one
+# line a boot rather than as five dashes on every line forever.
+THERMAL_PATH=""
+FREQ_PATH=""
+UVOLT_PATH=""
+THROTTLED_PATH=""
+powerprobed=0
+
+# Highest temperature seen this boot, in millidegrees. The peak matters more
+# than any single sample: at a 45s tick a hot soak is easy to sample either side
+# of, and this survives to the last line before power is cut.
+temp_max=""
+
+# Last-logged states, so the edge-triggered warnings below fire on a change
+# rather than on every tick.
+last_band=""
+last_uvolt=""
+last_throttled=""
+
+# Sticky: has the under-voltage alarm asserted at any point this boot. Starts
+# at 0 rather than empty so `uvoltseen=0` reads as "sampled, never asserted"
+# instead of as a missing field.
+uvolt_seen=0
+
+resolve_power_paths() {
+	# SoC temperature. thermal_zone0 is the CPU zone on every Pi, but walk the
+	# zones anyway rather than assume the numbering.
+	for z in /sys/class/thermal/thermal_zone*/temp; do
+		[ -r "$z" ] || continue
+		THERMAL_PATH="$z"
+		break
+	done
+
+	# ARM clock. scaling_cur_freq is what the governor last asked for;
+	# cpuinfo_cur_freq is what the hardware reports and is the better of the
+	# two, so prefer it when the driver provides it.
+	for f in /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq \
+	         /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; do
+		[ -r "$f" ] || continue
+		FREQ_PATH="$f"
+		break
+	done
+
+	# Under-voltage alarm, exposed by raspberrypi-hwmon as the "rpi_volt"
+	# device. Match on the name rather than a fixed hwmon number, which depends
+	# on probe order and is not stable across kernels.
+	for h in /sys/class/hwmon/hwmon*; do
+		[ -r "$h/name" ] || continue
+		case "$(cat "$h/name" 2>/dev/null)" in
+			rpi_volt)
+				[ -r "$h/in0_lcrit_alarm" ] && UVOLT_PATH="$h/in0_lcrit_alarm"
+				break
+				;;
+		esac
+	done
+
+	# Firmware throttle bitmask. Downstream Pi kernels have exposed this at a
+	# couple of paths over the years and dropped it again in places, so try both
+	# and treat its absence as normal rather than as a fault.
+	for t in /sys/devices/platform/soc/soc:firmware/get_throttled \
+	         /sys/devices/platform/soc/*.firmware/get_throttled; do
+		[ -r "$t" ] || continue
+		THROTTLED_PATH="$t"
+		break
+	done
+
+	logger -t heartbeat-power "sources: temp=$(dash "$THERMAL_PATH") freq=$(dash "$FREQ_PATH") uvolt=$(dash "$UVOLT_PATH") throttled=$(dash "$THROTTLED_PATH")"
+
+	# The trip points say where this board's firmware starts throttling, so a
+	# reader does not have to take 80C/85C on trust from a datasheet.
+	if [ -n "$THERMAL_PATH" ]; then
+		zdir=$(dirname "$THERMAL_PATH")
+		trips=""
+		for tp in "$zdir"/trip_point_*_temp; do
+			[ -r "$tp" ] || continue
+			tptype="${tp%_temp}_type"
+			trips="$trips $(basename "$tp"):$(cat "$tp" 2>/dev/null)m:$(cat "$tptype" 2>/dev/null)"
+		done
+		logger -t heartbeat-power "thermal zone $(cat "$zdir/type" 2>/dev/null) trips:$(dash "$trips")"
+	fi
+
+	if [ -n "$FREQ_PATH" ]; then
+		fdir=$(dirname "$FREQ_PATH")
+		logger -t heartbeat-power "cpufreq driver=$(cat "$fdir/scaling_driver" 2>/dev/null) gov=$(cat "$fdir/scaling_governor" 2>/dev/null) min=$(cat "$fdir/scaling_min_freq" 2>/dev/null)kHz max=$(cat "$fdir/scaling_max_freq" 2>/dev/null)kHz"
+	fi
+
+	# Say so plainly when a source is missing, because a run of "-" in the
+	# per-tick line otherwise reads as "cool and fine" when it means "not
+	# measured". The kernel options that supply these are set in
+	# board/common/kernel.config.
+	[ -z "$THERMAL_PATH" ] && logger -t heartbeat-power "no thermal zone: CONFIG_BCM2835_THERMAL missing, temp= will be - all drive"
+	[ -z "$FREQ_PATH" ]    && logger -t heartbeat-power "no cpufreq: CONFIG_ARM_RASPBERRYPI_CPUFREQ missing, freq= will be - all drive"
+	[ -z "$UVOLT_PATH" ]   && logger -t heartbeat-power "no rpi_volt hwmon: CONFIG_SENSORS_RASPBERRYPI_HWMON missing, uvolt= will be - all drive"
+	[ -z "$THROTTLED_PATH" ] && logger -t heartbeat-power "no get_throttled sysfs on this kernel; rely on uvolt= and the kernel's own under-voltage messages"
+}
+
+# Strip leading zeroes from a digit string, so it cannot be read as octal.
+#
+# The `*[!0-9]*` guards below accept "08" and "09", which are digit-only but
+# invalid octal literals, and BusyBox ash parses arithmetic operands base-0.
+# `$((08 / 1000))` is therefore a FATAL arith error, not a warning: it kills
+# this unsupervised script and the rest of the drive's telemetry with it. The
+# kernel formats every value read here with %d/%u so a leading zero should
+# never actually arrive, but the whole file is written on the premise that
+# garbage input must not kill the loop, and this is the one class of garbage
+# that still could. Not `$((10#$1))`, which is a bashism and would itself
+# break under ash.
+strip_leading_zeroes() {
+	stripped="${1#"${1%%[!0]*}"}"
+	if [ -n "$stripped" ]; then printf '%s' "$stripped"; else printf '0'; fi
+}
+
+millidegrees_to_c() {
+	# 53215 -> 53.2. Integer arithmetic only, this is BusyBox ash.
+	case "$1" in
+		''|*[!0-9]*) printf '-'; return ;;
+	esac
+	m=$(strip_leading_zeroes "$1")
+	printf '%s.%s' "$((m / 1000))" "$(((m % 1000) / 100))"
+}
+
+# Which side of the interesting thresholds the SoC is on. Named rather than
+# numeric so the log line reads without a lookup table.
+#
+# 80C is where this SoC's firmware starts throttling and 85C is its ceiling,
+# where throttling gets more aggressive. The bands are deliberately NOT called
+# "soft limit": the firmware has its own distinct `temp_soft_limit` setting
+# which is a different number, so that name would collide with an existing
+# term and mislead whoever greps this log in six months.
+temp_band() {
+	case "$1" in
+		''|*[!0-9]*) printf 'unknown'; return ;;
+	esac
+	if   [ "$1" -ge 85000 ]; then printf 'TEMP-CEILING'
+	elif [ "$1" -ge 80000 ]; then printf 'THROTTLING'
+	elif [ "$1" -ge 70000 ]; then printf 'hot'
+	else printf 'ok'
+	fi
+}
+
 while true; do
 	uptime_s=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 
@@ -65,6 +251,76 @@ while true; do
 
 	# Free space on the log partition, so we can see it filling if it ever does.
 	persist_free=$(df -k /persist 2>/dev/null | awk 'NR==2 {print $4"k"}')
+
+	# Thermal and power sampling. Resolved on the first tick rather than before
+	# the loop, so a driver that probes late is still picked up.
+	if [ "$powerprobed" = 0 ]; then
+		powerprobed=1
+		resolve_power_paths
+	fi
+
+	temp_m=""; temp_c=""; temp_max_c=""; freq_mhz=""; uvolt=""; throttled=""
+	if [ -n "$THERMAL_PATH" ]; then
+		temp_m=$(cat "$THERMAL_PATH" 2>/dev/null)
+		case "$temp_m" in
+			''|*[!0-9]*) temp_m="" ;;
+		esac
+	fi
+	if [ -n "$temp_m" ]; then
+		temp_c=$(millidegrees_to_c "$temp_m")
+		if [ -z "$temp_max" ] || [ "$temp_m" -gt "$temp_max" ]; then
+			temp_max="$temp_m"
+		fi
+	fi
+	# Converted outside the block above, and gated on the retained peak rather
+	# than on this tick's reading. Inside it, a single failed read would log
+	# `tempmax=-` while a perfectly good peak was still held in memory, which
+	# is exactly backwards for a high-water mark whose job is to survive the
+	# samples around it.
+	[ -n "$temp_max" ] && temp_max_c=$(millidegrees_to_c "$temp_max")
+
+	if [ -n "$FREQ_PATH" ]; then
+		freq_khz=$(cat "$FREQ_PATH" 2>/dev/null)
+		case "$freq_khz" in
+			''|*[!0-9]*) freq_khz="" ;;
+		esac
+		[ -n "$freq_khz" ] && freq_mhz=$(( $(strip_leading_zeroes "$freq_khz") / 1000 ))
+	fi
+
+	[ -n "$UVOLT_PATH" ] && uvolt=$(cat "$UVOLT_PATH" 2>/dev/null)
+	[ -n "$THROTTLED_PATH" ] && throttled=$(cat "$THROTTLED_PATH" 2>/dev/null)
+
+	# Sticky "has ever asserted this boot" flag for the under-voltage alarm.
+	#
+	# The alarm as read is an instantaneous state, so a sag shorter than the
+	# gap between two ticks is invisible: at a 45s interval that is most of a
+	# brownout. Temperature already carries a high-water mark for the same
+	# reason and voltage is the field that matters more here, so it gets one
+	# too. This is the local stand-in for the firmware's sticky throttle bits,
+	# which may not exist on this kernel at all.
+	if [ "$uvolt" = "1" ]; then uvolt_seen=1; fi
+
+	# Edge-triggered warnings, so a threshold crossing is one greppable line
+	# rather than something to be spotted by eye in a wall of ticks. Logged on
+	# the way down as well as up: "it cooled and then behaved" is exactly the
+	# pattern this whole block was added to test.
+	band=$(temp_band "$temp_m")
+	if [ "$band" != "unknown" ] && [ "$band" != "$last_band" ]; then
+		[ -n "$last_band" ] && logger -t heartbeat-power "temp band $last_band -> $band at ${temp_c}C (up=${uptime_s}s)"
+		last_band="$band"
+	fi
+	if [ -n "$uvolt" ] && [ "$uvolt" != "$last_uvolt" ]; then
+		if [ "$uvolt" = "1" ]; then
+			logger -t heartbeat-power "UNDER-VOLTAGE alarm asserted at up=${uptime_s}s temp=$(dash "$temp_c")C: the 5V rail crossed the alarm threshold, read this alongside the USB teardowns"
+		else
+			[ -n "$last_uvolt" ] && logger -t heartbeat-power "under-voltage alarm cleared at up=${uptime_s}s"
+		fi
+		last_uvolt="$uvolt"
+	fi
+	if [ -n "$throttled" ] && [ "$throttled" != "$last_throttled" ]; then
+		logger -t heartbeat-power "throttle flags $(dash "$last_throttled") -> $throttled at up=${uptime_s}s (bit0 undervolt now, bit1 freq capped, bit2 throttled, bit3 soft temp limit; bits 16-19 same, sticky since boot)"
+		last_throttled="$throttled"
+	fi
 
 	if [ "$configdumped" = 0 ]; then
 		wlaninfo=$(iw dev "$WLAN" info 2>/dev/null)
@@ -139,7 +395,7 @@ while true; do
 		conns=$(netstat -tn 2>/dev/null | grep -c ":$PORT .*ESTABLISHED")
 	fi
 
-	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") conns=$(dash "$conns") persistfree=$(dash "$persist_free")"
+	logger -t heartbeat "up=${uptime_s}s aawgd=$(dash "$aawgd") assoc=$(dash "$assoc") txrate=$(dash "$txrate")M rxrate=$(dash "$rxrate")M txfailed=$(dash "$txfailed") rxbytes=$(dash "$rxbytes") txbytes=$(dash "$txbytes") rxpkts=$(dash "$rxpkts") txpkts=$(dash "$txpkts") conns=$(dash "$conns") persistfree=$(dash "$persist_free") temp=$(dash "$temp_c")C tempmax=$(dash "$temp_max_c")C freq=$(dash "$freq_mhz")M uvolt=$(dash "$uvolt") uvoltseen=$(dash "$uvolt_seen") throttled=$(dash "$throttled")"
 
 	# Flush so the tail survives an abrupt power cut at ignition-off, but no
 	# more often than SYNC_INTERVAL of elapsed time. If /proc/uptime gave us
