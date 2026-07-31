@@ -75,20 +75,55 @@ public:
 };
 
 
+// Every outbound D-Bus call can throw, and most of them had no handler anywhere up the
+// stack, so one bluez or controller fault took the whole daemon down. Drive 2 died on
+// DBus::ErrorNoReply. Drive 7 died 23 times in a single boot on DBus::Error
+// "Authentication Failed", thrown by setPower(true) once the controller stopped answering
+// HCI_Reset (kernel: "hci0: Opcode 0x0c03 failed: -110"). aawgd-supervise respawned it
+// every 5.3s for two minutes and none of it could ever work, because restarting a process
+// cannot reset a wedged controller.
+//
+// Failing to power the adapter is a fault to report and retry. It is not a reason to abort,
+// so every outbound call goes through here and reports instead of throwing.
+template <typename Call>
+static bool dbusTry(const char* what, Call&& call) {
+    try {
+        call();
+        return true;
+    } catch (const DBus::Error& e) {
+        Logger::instance()->info("D-Bus call failed (%s): %s\n", what, e.what());
+    } catch (const std::exception& e) {
+        Logger::instance()->info("D-Bus call failed (%s): %s\n", what, e.what());
+    } catch (...) {
+        Logger::instance()->info("D-Bus call failed (%s): unknown exception\n", what);
+    }
+    return false;
+}
+
 BluetoothHandler& BluetoothHandler::instance() {
     static BluetoothHandler instance;
     return instance;
 }
 
-DBus::ManagedObjects BluetoothHandler::getBluezObjects() {
-    std::shared_ptr<DBus::ObjectProxy> m_bluezRootObject = m_connection->create_object_proxy(BLUEZ_BUS_NAME, BLUEZ_ROOT_OBJECT_PATH);
-    DBus::MethodProxy getManagedObjects = *(m_bluezRootObject->create_method<DBus::ManagedObjects(void)>("org.freedesktop.DBus.ObjectManager", "GetManagedObjects"));
+bool BluetoothHandler::getBluezObjects(DBus::ManagedObjects& objects) {
+    return dbusTry("GetManagedObjects", [&] {
+        std::shared_ptr<DBus::ObjectProxy> m_bluezRootObject = m_connection->create_object_proxy(BLUEZ_BUS_NAME, BLUEZ_ROOT_OBJECT_PATH);
+        DBus::MethodProxy getManagedObjects = *(m_bluezRootObject->create_method<DBus::ManagedObjects(void)>("org.freedesktop.DBus.ObjectManager", "GetManagedObjects"));
 
-    return getManagedObjects();
+        objects = getManagedObjects();
+    });
 }
 
-void BluetoothHandler::initAdapter() {
-    DBus::ManagedObjects objects = getBluezObjects();
+bool BluetoothHandler::initAdapter() {
+    DBus::ManagedObjects objects;
+
+    // Failing to enumerate is not the same as enumerating nothing. Carrying on here would
+    // leave m_adapter null for the rest of the drive with no way back, where the throw this
+    // replaced took the process down and the supervisor restarted into a working bluez.
+    if (!getBluezObjects(objects)) {
+        Logger::instance()->info("Could not enumerate bluez objects\n");
+        return false;
+    }
 
     std::string adapter_path;
     for (auto const& [path, interfaces]: objects) {
@@ -105,37 +140,68 @@ void BluetoothHandler::initAdapter() {
     }
 
     if (adapter_path.empty()) {
+        // bluez answered and there is genuinely no adapter. Restarting cannot change that,
+        // so this is a success: the daemon runs on without bluetooth, as upstream does.
         Logger::instance()->info("Did not find any bluetooth adapters\n");
     }
     else {
         m_adapter = BluezAdapterProxy::create(m_connection, adapter_path);
-        m_adapter->alias->set_value(m_adapterAlias);
-        Logger::instance()->info("Bluetooth adapter alias: %s\n", m_adapterAlias.c_str());
+
+        // A cosmetic setting, so a failure here must not cost us the adapter itself.
+        if (dbusTry("Adapter.Alias", [&] { m_adapter->alias->set_value(m_adapterAlias); })) {
+            Logger::instance()->info("Bluetooth adapter alias: %s\n", m_adapterAlias.c_str());
+        }
     }
+
+    return true;
 }
 
-void BluetoothHandler::setPower(bool on) {
+bool BluetoothHandler::setPower(bool on) {
     if (!m_adapter) {
-        return;
+        return false;
     }
 
-    m_adapter->powered->set_value(on);
+    if (!dbusTry("Adapter.Powered", [&] { m_adapter->powered->set_value(on); })) {
+        return false;
+    }
+
+    // Logged only on success, deliberately. The absence of this line before each of Drive 7's
+    // aborts is what proved the throw was in set_value and not in the setPairable that follows.
     Logger::instance()->info("Bluetooth adapter was powered %s\n", on ? "on" : "off");
+    return true;
 }
 
-void BluetoothHandler::setPairable(bool pairable) {
+bool BluetoothHandler::setPairable(bool pairable) {
     if (!m_adapter) {
-        return;
+        return false;
     }
 
-    m_adapter->discoverable->set_value(pairable);
-    m_adapter->pairable->set_value(pairable);
-    Logger::instance()->info("Bluetooth adapter is now discoverable and pairable\n");
+    // Both are attempted even if the first fails, hence the deliberate operand order.
+    bool ok = dbusTry("Adapter.Discoverable", [&] { m_adapter->discoverable->set_value(pairable); });
+    ok = dbusTry("Adapter.Pairable", [&] { m_adapter->pairable->set_value(pairable); }) && ok;
+
+    if (ok) {
+        Logger::instance()->info("Bluetooth adapter is now discoverable and pairable\n");
+    }
+    return ok;
 }
 
-void BluetoothHandler::exportProfiles() {
-    std::shared_ptr<DBus::ObjectProxy> bluezObject = m_connection->create_object_proxy(BLUEZ_BUS_NAME, BLUEZ_OBJECT_PATH);
-    DBus::MethodProxy registerProfile = *(bluezObject->create_method<void(DBus::Path, std::string, DBus::Properties)>(INTERFACE_BLUEZ_PROFILE_MANAGER, "RegisterProfile"));
+bool BluetoothHandler::exportProfiles() {
+    // Both are held at function scope so the method proxy outlives the object proxy it
+    // came from, matching how connectDevice keeps its device proxy alive.
+    std::shared_ptr<DBus::ObjectProxy> bluezObject;
+    std::shared_ptr<DBus::MethodProxy<void(DBus::Path, std::string, DBus::Properties)>> registerProfile;
+
+    // Every failure below is reported rather than swallowed. Without the AA Wireless profile
+    // the phone has no way to start a session at all, so a daemon that keeps running without
+    // it is a dongle that is up, silent, and unfixable short of a power cycle.
+    if (!dbusTry("ProfileManager proxy", [&] {
+        bluezObject = m_connection->create_object_proxy(BLUEZ_BUS_NAME, BLUEZ_OBJECT_PATH);
+        registerProfile = bluezObject->create_method<void(DBus::Path, std::string, DBus::Properties)>(INTERFACE_BLUEZ_PROFILE_MANAGER, "RegisterProfile");
+    }) || !registerProfile) {
+        Logger::instance()->info("Could not reach the bluez profile manager\n");
+        return false;
+    }
 
     // Register AA Wireless Profile
     m_aawProfile = AAWirelessProfile::create(AAWG_PROFILE_OBJECT_PATH);
@@ -143,11 +209,15 @@ void BluetoothHandler::exportProfiles() {
         Logger::instance()->info("Failed to register AA Wireless profile\n");
     }
 
-    registerProfile(AAWG_PROFILE_OBJECT_PATH, AAWG_PROFILE_UUID, {
-        {"Name", DBus::Variant("AA Wireless")},
-        {"Role", DBus::Variant("server")},
-        {"Channel", DBus::Variant(uint16_t(8))},
-    });
+    if (!dbusTry("RegisterProfile(AA Wireless)", [&] {
+        (*registerProfile)(AAWG_PROFILE_OBJECT_PATH, AAWG_PROFILE_UUID, {
+            {"Name", DBus::Variant("AA Wireless")},
+            {"Role", DBus::Variant("server")},
+            {"Channel", DBus::Variant(uint16_t(8))},
+        });
+    })) {
+        return false;
+    }
     Logger::instance()->info("Bluetooth AA Wireless profile active\n");
 
     if (Config::instance()->getConnectionStrategy() != ConnectionStrategy::DONGLE_MODE) {
@@ -156,16 +226,22 @@ void BluetoothHandler::exportProfiles() {
         if (m_connection->register_object(m_hspProfile, DBus::ThreadForCalling::DispatcherThread) != DBus::RegistrationStatus::Success) {
             Logger::instance()->info("Failed to register HSP Handset profile\n");
         }
-        registerProfile(HSP_HS_PROFILE_OBJECT_PATH, HSP_HS_UUID, {
-            {"Name", DBus::Variant("HSP HS")},
-        });
+        if (!dbusTry("RegisterProfile(HSP HS)", [&] {
+            (*registerProfile)(HSP_HS_PROFILE_OBJECT_PATH, HSP_HS_UUID, {
+                {"Name", DBus::Variant("HSP HS")},
+            });
+        })) {
+            return false;
+        }
         Logger::instance()->info("HSP Handset profile active\n");
     }
+
+    return true;
 }
 
-void BluetoothHandler::startAdvertising() {
+bool BluetoothHandler::startAdvertising() {
     if (!m_adapter) {
-        return;
+        return false;
     }
 
     // Register Advertisement Object
@@ -179,8 +255,12 @@ void BluetoothHandler::startAdvertising() {
         Logger::instance()->info("Failed to register BLE Advertisement\n");
     }
 
-    (*m_adapter->registerAdvertisement)(LE_ADVERTISEMENT_OBJECT_PATH, {});
+    if (!dbusTry("RegisterAdvertisement", [&] { (*m_adapter->registerAdvertisement)(LE_ADVERTISEMENT_OBJECT_PATH, {}); })) {
+        return false;
+    }
+
     Logger::instance()->info("BLE Advertisement started\n");
+    return true;
 }
 
 void BluetoothHandler::stopAdvertising() {
@@ -188,12 +268,20 @@ void BluetoothHandler::stopAdvertising() {
         return;
     }
 
-    (*m_adapter->unregisterAdvertisement)(LE_ADVERTISEMENT_OBJECT_PATH);
-    Logger::instance()->info("BLE Advertisement stopped\n");
+    if (dbusTry("UnregisterAdvertisement", [&] { (*m_adapter->unregisterAdvertisement)(LE_ADVERTISEMENT_OBJECT_PATH); })) {
+        Logger::instance()->info("BLE Advertisement stopped\n");
+    }
 }
 
 BluetoothHandler::ConnectResult BluetoothHandler::connectDevice() {
-    DBus::ManagedObjects objects = getBluezObjects();
+    DBus::ManagedObjects objects;
+
+    // Here, unlike at startup, a failed enumeration is just a bad round: the retry loop
+    // comes back in 20 seconds. NoDevices rather than Unreachable, so a bluez hiccup cannot
+    // accumulate towards an adapter power cycle it had nothing to do with.
+    if (!getBluezObjects(objects)) {
+        return ConnectResult::NoDevices;
+    }
 
     std::vector<std::string> device_paths;
     for (auto const& [path, interfaces]: objects) {
@@ -259,7 +347,11 @@ BluetoothHandler::ConnectResult BluetoothHandler::connectDevice() {
             }
         } catch (DBus::Error& e) {
             if (!isDongleMode) {
-                Logger::instance()->info("Failed to connect device at path: %s\n", device_path.c_str());
+                // The error text is the discriminator this project has been guessing at:
+                // bluez says "Host is down" when the device object is stale and the ACL
+                // underneath is gone, which is a different fault to a phone that is simply
+                // absent. Drive 7 threw it away because e was declared and never read.
+                Logger::instance()->info("Failed to connect device at path %s: %s\n", device_path.c_str(), e.what());
             }
         } catch (const std::exception& e) {
             // Anything that is not a DBus::Error would otherwise unwind out of the retry
@@ -288,17 +380,18 @@ void BluetoothHandler::resetAdapter(int attempts) {
 
     Logger::instance()->info("Bluetooth reconnect stuck after %d attempts, power cycling the adapter\n", attempts);
 
-    try {
-        setPower(false);
-        std::this_thread::sleep_for(ADAPTER_RESET_SETTLE_TIME);
-        setPower(true);
-        setPairable(true);
-    } catch (const std::exception& e) {
-        // Best effort. A failed reset must not take the retry loop down with it.
-        Logger::instance()->info("Bluetooth adapter power cycle failed: %s\n", e.what());
-    } catch (...) {
-        Logger::instance()->info("Bluetooth adapter power cycle failed with an unknown exception\n");
+    // setPower and setPairable report rather than throw now, so the outcome is checked
+    // instead of caught. A reset that cannot power the adapter back on is the wedged
+    // controller case, and saying so plainly is the only useful thing to do about it here.
+    setPower(false);
+    std::this_thread::sleep_for(ADAPTER_RESET_SETTLE_TIME);
+
+    if (!setPower(true)) {
+        Logger::instance()->info("Bluetooth adapter did not come back after the power cycle\n");
+        return;
     }
+
+    setPairable(true);
 }
 
 void BluetoothHandler::retryConnectLoop() {
@@ -357,10 +450,15 @@ void BluetoothHandler::retryConnectLoop() {
     }
 }
 
-void BluetoothHandler::init() {
+bool BluetoothHandler::init() {
     // DBus::set_logging_function( DBus::log_std_err );
     // DBus::set_log_level( SL_TRACE );
 
+    // Deliberately NOT guarded, unlike everything below it. If the system bus itself cannot
+    // be reached there is nothing to degrade to, and the usual cause is bluetoothd not being
+    // up yet, which a supervisor restart three seconds later genuinely does fix. That is the
+    // opposite of the wedged-controller case, where restarting the process achieves nothing
+    // and the retry has to happen in place.
     m_dispatcher = DBus::StandaloneDispatcher::create();
     m_connection = m_dispatcher->create_connection( DBus::BusType::SYSTEM );
 
@@ -368,21 +466,46 @@ void BluetoothHandler::init() {
 
     m_adapterAlias = adapterAliasPrefix + Config::instance()->getUniqueSuffix();
 
-    initAdapter();
-    exportProfiles();
+    if (!initAdapter()) {
+        return false;
+    }
+
+    return exportProfiles();
 }
 
-void BluetoothHandler::powerOn() {
+bool BluetoothHandler::hasAdapter() const {
+    return m_adapter != nullptr;
+}
+
+bool BluetoothHandler::powerOn() {
     if (!m_adapter) {
-        return;
+        return false;
     }
 
-    setPower(true);
-    setPairable(true);
+    if (!setPower(true)) {
+        return false;
+    }
+
+    // Deliberately not fatal. An already-bonded phone connects fine without this, and that
+    // is the normal case, so failing powerOn here would block a working session for the sake
+    // of a pairing that is not being attempted. It does mean a NEW phone cannot pair until
+    // the next boot, which is why it is logged rather than ignored.
+    if (!setPairable(true)) {
+        Logger::instance()->info("Bluetooth adapter is powered but not discoverable, a new phone will not be able to pair\n");
+    }
 
     if (Config::instance()->getConnectionStrategy() == ConnectionStrategy::DONGLE_MODE) {
-        startAdvertising();
+        // Also deliberately not fatal, and this one is a known limitation rather than a
+        // considered trade. Retrying would re-register the same object path and almost
+        // certainly fail on AlreadyExists, turning a degraded dongle mode into a retry loop
+        // that can never succeed. Dongle mode is not the strategy this hardware runs, so it
+        // is logged plainly and left for someone who can test that path.
+        if (!startAdvertising()) {
+            Logger::instance()->info("BLE advertisement failed, dongle mode will not be discoverable until restart\n");
+        }
     }
+
+    return true;
 }
 
 std::optional<std::thread> BluetoothHandler::connectWithRetry() {
