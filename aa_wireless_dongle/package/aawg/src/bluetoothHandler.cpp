@@ -486,12 +486,15 @@ bool BluetoothHandler::powerOn() {
         return false;
     }
 
-    // Deliberately not fatal. An already-bonded phone connects fine without this, and that
-    // is the normal case, so failing powerOn here would block a working session for the sake
-    // of a pairing that is not being attempted. It does mean a NEW phone cannot pair until
-    // the next boot, which is why it is logged rather than ignored.
+    // Deliberately not fatal. Discoverable and pairable only matter while a phone is being
+    // bonded; an already-bonded phone connects without either. Failing powerOn here would
+    // block a working session for the sake of a pairing that is not being attempted.
+    //
+    // The one case where it does bite is the first boot after a reflash, which wipes the
+    // bond and forces a re-pair. That is a narrow window and a known one, so it is logged
+    // rather than either ignored or escalated.
     if (!setPairable(true)) {
-        Logger::instance()->info("Bluetooth adapter is powered but not discoverable, a new phone will not be able to pair\n");
+        Logger::instance()->info("Bluetooth adapter is powered but not discoverable, pairing will not work until this is fixed or the board is rebooted\n");
     }
 
     if (Config::instance()->getConnectionStrategy() == ConnectionStrategy::DONGLE_MODE) {
