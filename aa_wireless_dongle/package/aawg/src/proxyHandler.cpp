@@ -12,6 +12,7 @@
 #include <optional>
 #include <atomic>
 #include <string>
+#include <system_error>
 
 #include "common.h"
 #include "usb.h"
@@ -156,11 +157,14 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
             if (read_errno == EINTR && should_exit) {
                 break;
             }
-            Logger::instance()->info("Teardown: read from %s failed: %s\n", read_name.c_str(), teardownReason(read_errno));
+            // The USB link state at the instant the transfer failed, which is the
+            // one moment worth measuring it: "not-attached" means VBUS went away,
+            // anything else means it held and the data path failed instead.
+            Logger::instance()->info("Teardown: read from %s failed: %s [%s]\n", read_name.c_str(), teardownReason(read_errno), UsbManager::udcStatus().c_str());
             break;
         }
         else if (len == 0) {
-            Logger::instance()->info("Teardown: %s closed the connection (EOF)\n", read_name.c_str());
+            Logger::instance()->info("Teardown: %s closed the connection (EOF) [%s]\n", read_name.c_str(), UsbManager::udcStatus().c_str());
             break;
         }
         else if (should_exit) {
@@ -183,15 +187,101 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
             if (write_errno == EINTR && should_exit) {
                 break;
             }
-            Logger::instance()->info("Teardown: write to %s failed: %s\n", write_name.c_str(), teardownReason(write_errno));
+            Logger::instance()->info("Teardown: write to %s failed: %s [%s]\n", write_name.c_str(), teardownReason(write_errno), UsbManager::udcStatus().c_str());
             break;
         }
         else if (should_exit) {
             break;
         }
+
+        // Count only bytes that actually reached the far side. writeFully returns
+        // the full length or a negative, so wlen here is always the whole buffer.
+        if (direction == ProxyDirection::TCP_to_USB) {
+            m_tcp_to_usb_bytes += static_cast<uint64_t>(wlen);
+        } else {
+            m_usb_to_tcp_bytes += static_cast<uint64_t>(wlen);
+        }
     }
 
     stopForwarding(should_exit);
+}
+
+// A session that stops carrying data without dropping is invisible to everything
+// else here. The 30s SO_RCVTIMEO fires only on *zero* bytes, so a trickle keeps it
+// armed indefinitely: on Drive 8 a session sat at 1.4 kB/s for 160 seconds, with
+// the phone associated at 72.2M and aawgd reporting a live connection throughout,
+// and only ended when the USB transfer finally errored. From the driver's seat
+// that is a frozen screen for nearly three minutes.
+//
+// This only reports. It deliberately does not tear the session down, for two
+// reasons. The symptom being chased is Android Auto disappearing off the head
+// unit, and an over-eager teardown here would manufacture exactly that. And the
+// floor below is calibrated against one drive, with no capture yet of what a
+// legitimately idle session looks like (head unit switched to radio, screen off).
+// Once a drive shows the floor separating real stalls from idle cleanly, turning
+// this into a teardown is a two-line change and converts a three-minute freeze
+// into a ~7s reconnect.
+static constexpr int STALL_WINDOW_SECONDS = 20;
+
+// 10 kB/s. Healthy sessions on this rig never dropped below ~180 kB/s, and the
+// observed stalls sat between 0.4 and 7.5 kB/s, so this sits in a gap of more
+// than an order of magnitude on both sides.
+static constexpr uint64_t STALL_FLOOR_BYTES_PER_SECOND = 10240;
+
+void AAWProxy::monitorThroughput(std::atomic<bool>& should_exit) {
+    uint64_t window_start_tcp_usb = m_tcp_to_usb_bytes;
+    uint64_t window_start_usb_tcp = m_usb_to_tcp_bytes;
+    std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
+    bool stalled = false;
+
+    while (!should_exit) {
+        // Poll at 100ms rather than sleeping out the whole window, for one reason
+        // that is not about accuracy: this thread is joined on teardown, so however
+        // long it sleeps is added to every reconnect. The symptom being measured is
+        // a ~7s outage, and a monitor that could add a second to it would be
+        // corrupting the very number it exists to record.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (should_exit) {
+            break;
+        }
+
+        // Elapsed from the clock rather than a count of completed sleeps, so a
+        // descheduled thread reports the window it actually measured.
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        long long elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - window_start).count();
+        if (elapsed < STALL_WINDOW_SECONDS) {
+            continue;
+        }
+
+        uint64_t tcp_usb = m_tcp_to_usb_bytes - window_start_tcp_usb;
+        uint64_t usb_tcp = m_usb_to_tcp_bytes - window_start_usb_tcp;
+        uint64_t total_per_second = (tcp_usb + usb_tcp) / static_cast<uint64_t>(elapsed);
+
+        if (total_per_second < STALL_FLOOR_BYTES_PER_SECOND) {
+            // Both directions are reported because which one dried up first is the
+            // discriminator: TCP_to_USB dry means the phone stopped sending, while
+            // TCP_to_USB moving with USB_to_TCP dry means the head unit stopped
+            // answering. No capture so far can tell those apart.
+            Logger::instance()->info("%s: %llus at %llu B/s (tcp->usb %llu B, usb->tcp %llu B) [%s]\n",
+                stalled ? "Stall continuing" : "Stall",
+                (unsigned long long)elapsed,
+                (unsigned long long)total_per_second,
+                (unsigned long long)tcp_usb,
+                (unsigned long long)usb_tcp,
+                UsbManager::udcStatus().c_str());
+            stalled = true;
+        } else if (stalled) {
+            Logger::instance()->info("Stall cleared: %llu B/s (tcp->usb %llu B, usb->tcp %llu B)\n",
+                (unsigned long long)total_per_second,
+                (unsigned long long)tcp_usb,
+                (unsigned long long)usb_tcp);
+            stalled = false;
+        }
+
+        window_start_tcp_usb = m_tcp_to_usb_bytes;
+        window_start_usb_tcp = m_usb_to_tcp_bytes;
+        window_start = now;
+    }
 }
 
 void AAWProxy::stopForwarding(std::atomic<bool>& should_exit) {
@@ -225,7 +315,9 @@ void AAWProxy::handleClient(int server_sock) {
 
     if (Config::instance()->getConnectionStrategy() != ConnectionStrategy::USB_FIRST) {
         if (!UsbManager::instance().enableDefaultAndWaitForAccessory(std::chrono::seconds(30))) {
-            Logger::instance()->info("Teardown: usb accessory did not connect within 30s\n");
+            // Drive 8 hit this three times. The gadget state says whether the head
+            // unit ignored an enumerated device or never enumerated one at all.
+            Logger::instance()->info("Teardown: usb accessory did not connect within 30s [%s]\n", UsbManager::udcStatus().c_str());
             return;
         }
     }
@@ -302,16 +394,42 @@ void AAWProxy::handleClient(int server_sock) {
         Logger::instance()->info("Adding signal handler failed: %s\n", strerror(errno));
     }
 
-    Logger::instance()->info("Forwarding data between TCP and USB\n");
+    Logger::instance()->info("Forwarding data between TCP and USB [%s]\n", UsbManager::udcStatus().c_str());
     std::atomic<bool> should_exit = false;
+    m_session_start = std::chrono::steady_clock::now();
     m_usb_tcp_thread = std::thread(&AAWProxy::forward, this, ProxyDirection::USB_to_TCP, std::ref(should_exit));
     m_tcp_usb_thread = std::thread(&AAWProxy::forward, this, ProxyDirection::TCP_to_USB, std::ref(should_exit));
+
+    // Guarded, and the reason is the whole point of the previous round. std::thread
+    // construction throws std::system_error if pthread_create fails, and an escape
+    // from here would be doubly fatal: the exception would unwind past two joinable
+    // forwarding threads, and ~std::thread on a joinable thread calls std::terminate.
+    // That is precisely the abort class round 8 existed to remove, and it would be
+    // absurd to reintroduce it for a diagnostic.
+    //
+    // This monitor is pure instrumentation, so losing it must never cost the
+    // session. Log and carry on: the drive still gets its data, just not the stall
+    // lines, and the log says which.
+    try {
+        m_monitor_thread = std::thread(&AAWProxy::monitorThroughput, this, std::ref(should_exit));
+    } catch (const std::system_error& e) {
+        m_monitor_thread = std::nullopt;
+        Logger::instance()->info("Could not start throughput monitor, continuing without stall detection: %s\n", e.what());
+    }
 
     m_usb_tcp_thread->join();
     m_usb_tcp_thread = std::nullopt;
 
     m_tcp_usb_thread->join();
     m_tcp_usb_thread = std::nullopt;
+
+    // Joined last, and only after should_exit is already set by stopForwarding, so
+    // at most one 100ms poll is being waited on. Optional because the monitor is
+    // allowed to have failed to start without taking the session with it.
+    if (m_monitor_thread) {
+        m_monitor_thread->join();
+        m_monitor_thread = std::nullopt;
+    }
 
     signal(SIGUSR1, SIG_DFL);
 
@@ -320,6 +438,26 @@ void AAWProxy::handleClient(int server_sock) {
 
     close(m_tcp_fd);
     m_tcp_fd = -1;
+
+    // One line per session, so a drive can be read as "how long did each session
+    // last and how much did it actually carry" without deriving it from the wlan0
+    // counters. Sessions that ran their whole life below the healthy floor, as the
+    // first session of Drive 8 boot 5 did at 7.5 kB/s, are visible here even when
+    // they were too short for the stall window to fire.
+    long long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - m_session_start).count();
+    uint64_t tcp_usb = m_tcp_to_usb_bytes;
+    uint64_t usb_tcp = m_usb_to_tcp_bytes;
+    // Guard the divisor: a session can end in well under a millisecond if the
+    // accessory drops immediately, and a rate line must not be the thing that
+    // divides by zero.
+    uint64_t divisor_ms = duration_ms > 0 ? static_cast<uint64_t>(duration_ms) : 1;
+    Logger::instance()->info(
+        "Session ended: %lld.%03llds, tcp->usb %llu B (%llu B/s), usb->tcp %llu B (%llu B/s) [%s]\n",
+        duration_ms / 1000, duration_ms % 1000,
+        (unsigned long long)tcp_usb, (unsigned long long)(tcp_usb * 1000 / divisor_ms),
+        (unsigned long long)usb_tcp, (unsigned long long)(usb_tcp * 1000 / divisor_ms),
+        UsbManager::udcStatus().c_str());
 
     Logger::instance()->info("Forwarding stopped\n");
 }

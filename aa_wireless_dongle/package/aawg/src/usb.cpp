@@ -1,4 +1,6 @@
+#include <ctype.h>
 #include <dirent.h>
+#include <stdio.h>
 #include <string.h>
 #include <future>
 
@@ -47,6 +49,58 @@ UsbManager::UsbManager() {
     } else {
         Logger::instance()->info("USB Manager: Found UDC %s\n", s_udcName.c_str());
     }
+}
+
+// Read a single-line attribute from the UDC's sysfs directory, trimmed.
+//
+// Returns "-" when the UDC name is unknown or the attribute cannot be read, so a
+// missing reading is never mistaken for a real state. That matters here: these
+// values are used to decide between two hardware faults, and "we did not measure
+// it" has to stay distinguishable from "it read not-attached".
+/*static*/ std::string UsbManager::udcAttribute(const char* attribute) {
+    if (s_udcName.empty()) {
+        return "-";
+    }
+
+    std::string path = "/sys/class/udc/" + s_udcName + "/" + attribute;
+    FILE* file = fopen(path.c_str(), "r");
+    if (file == NULL) {
+        return "-";
+    }
+
+    // 32 is deliberate rather than generous. Both attributes are short fixed
+    // vocabularies from the kernel ("configured", "not-attached", "high-speed",
+    // "super-speed-plus"), and these values are appended to teardown lines that
+    // BusyBox syslogd truncates at a fixed length. Bounding the read here keeps a
+    // sysfs surprise from silently eating the end of the line it was added to.
+    char buffer[32] = {0};
+    char* line = fgets(buffer, sizeof(buffer), file);
+    fclose(file);
+
+    if (line == NULL) {
+        return "-";
+    }
+
+    std::string value(buffer);
+    // Trim the trailing newline sysfs adds, so the value composes into a log line.
+    while (!value.empty() && isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+
+    return value.empty() ? "-" : value;
+}
+
+// The reading that separates the two physical failure stories eight drives of
+// logs cannot currently tell apart.
+//
+// "udcstate=not-attached" means VBUS went away, which is the power or ground
+// contact breaking. Anything else, particularly holding at "configured" or
+// cycling through "default"/"addressed", means VBUS stayed up and the data pair
+// failed instead. "udcspeed" catches the other half: Drive 8 recorded two falls
+// back to "full-speed", which is the high-speed handshake failing outright, and
+// Android Auto cannot run over 12 Mbit/s.
+/*static*/ std::string UsbManager::udcStatus() {
+    return "udcstate=" + udcAttribute("state") + " udcspeed=" + udcAttribute("current_speed");
 }
 
 void UsbManager::writeGadgetFile(std::string gadgetName, std::string relativeFilePath, const char* content) {

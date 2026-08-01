@@ -122,6 +122,17 @@ temp_max=""
 last_band=""
 last_uvolt=""
 last_throttled=""
+last_usb=""
+
+# The USB gadget's sysfs directory, resolved once. aawgd finds the same UDC by
+# taking the last entry in /sys/class/udc; there is exactly one on this hardware
+# (3f980000.usb), so any entry is the right one. Empty means the gadget driver
+# did not probe, which is worth seeing rather than silently skipping.
+UDC_DIR=""
+for u in /sys/class/udc/*; do
+	[ -d "$u" ] || continue
+	UDC_DIR="$u"
+done
 
 # Sticky: has the under-voltage alarm asserted at any point this boot. Starts
 # at 0 rather than empty so `uvoltseen=0` reads as "sampled, never asserted"
@@ -205,6 +216,21 @@ resolve_power_paths() {
 	[ -z "$FREQ_PATH" ]    && logger -t heartbeat-power "no cpufreq: CONFIG_ARM_RASPBERRYPI_CPUFREQ missing, freq= will be - all drive"
 	[ -z "$UVOLT_PATH" ]   && logger -t heartbeat-power "no rpi_volt hwmon: CONFIG_SENSORS_RASPBERRYPI_HWMON missing, uvolt= will be - all drive"
 	[ -z "$THROTTLED_PATH" ] && logger -t heartbeat-power "no get_throttled sysfs on this kernel; rely on uvolt= and the kernel's own under-voltage messages"
+
+	# Same contract as the lines above: say what was found, and say plainly when
+	# nothing was, so an absence of usb-state lines during a drive cannot be read
+	# as "the USB link never changed".
+	#
+	# The interval is reported here too. It has now been left at the 45s default on
+	# three diagnostic drives in a row while the notes assumed 8s, and reading a
+	# capture at the wrong assumed resolution is worse than reading it at a known
+	# coarse one. This puts the answer in the first few lines of every boot.
+	logger -t heartbeat-usb "interval=${INTERVAL}s syncinterval=${SYNC_INTERVAL}s"
+	if [ -n "$UDC_DIR" ]; then
+		logger -t heartbeat-usb "source udc=$UDC_DIR state=$(dash "$(cat "$UDC_DIR/state" 2>/dev/null)") speed=$(dash "$(cat "$UDC_DIR/current_speed" 2>/dev/null)")"
+	else
+		logger -t heartbeat-usb "no udc under /sys/class/udc: gadget driver did not probe, usb-state lines will be absent all drive"
+	fi
 }
 
 # Strip leading zeroes from a digit string, so it cannot be read as octal.
@@ -425,5 +451,63 @@ while true; do
 		last_sync="$uptime_i"
 	fi
 
-	sleep "$INTERVAL"
+	# Wait out the tick one second at a time, watching the USB gadget link on the
+	# way. This is the poll that catches the symptom Chay actually reports: Android
+	# Auto vanishing off the head unit and returning about ten seconds later, which
+	# is the gadget being torn down and re-enumerated. At the 45s tick that whole
+	# event fits between two samples and is invisible.
+	#
+	# Edge triggered, so a stable link costs one comparison a second and logs
+	# nothing. Two values are worth having:
+	#
+	#   state         not-attached / attached / powered / default / addressed /
+	#                 configured. "not-attached" means VBUS went away, which is the
+	#                 power or ground contact. Anything else means VBUS held and the
+	#                 data pair failed instead. That is the single distinction eight
+	#                 drives of logs have never been able to make.
+	#   current_speed high-speed is normal. Drive 8 recorded two falls back to
+	#                 full-speed, which is the high-speed handshake failing outright,
+	#                 and Android Auto cannot run over 12 Mbit/s.
+	#
+	# Note the resolution limit rather than rediscovering it: the worst storm in
+	# Drive 8 re-enumerated every ~340ms, so a 1s poll shows the churn but cannot
+	# count the attempts. The kernel's own "new device is <speed>" lines still do
+	# that, and klogd already puts them in this file.
+	#
+	# Built-in `read` with a redirect rather than $(cat ...), deliberately. This
+	# runs once a second for the whole drive, and a command substitution forks a
+	# subshell while a redirect into `read` forks nothing, so the steady state of a
+	# link that is not changing costs no processes at all. The `-r` file test guards
+	# against a missing attribute becoming a redirect failure in a loop that nothing
+	# supervises.
+	waited=0
+	while [ "$waited" -lt "$INTERVAL" ]; do
+		sleep 1
+		waited=$((waited + 1))
+
+		[ -n "$UDC_DIR" ] || continue
+
+		usb_state=""
+		usb_speed=""
+		# The `2>/dev/null` sits before the input redirect on purpose. The UDC
+		# directory disappears if the gadget driver ever unbinds, so the file can go
+		# away between the -r test and the redirect. `read` is a regular builtin, not
+		# a POSIX special one, so a failed redirect fails the command and leaves the
+		# shell running (verified under dash); the variable stays empty and the line
+		# logs "-", which is the intended degraded reading. All that is left to
+		# suppress is the error text, and redirections are applied left to right, so
+		# stderr has to be pointed away first or the message still escapes.
+		[ -r "$UDC_DIR/state" ] && read -r usb_state 2>/dev/null < "$UDC_DIR/state"
+		[ -r "$UDC_DIR/current_speed" ] && read -r usb_speed 2>/dev/null < "$UDC_DIR/current_speed"
+		[ -n "$usb_state" ] || usb_state="-"
+		[ -n "$usb_speed" ] || usb_speed="-"
+		usb_now="$usb_state/$usb_speed"
+
+		if [ "$usb_now" != "$last_usb" ]; then
+			# Uptime is re-read here rather than reused from the tick above, so the
+			# transition carries its own timestamp instead of the tick's.
+			logger -t usb-state "up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)s $(dash "$last_usb") -> $usb_now"
+			last_usb="$usb_now"
+		fi
+	done
 done

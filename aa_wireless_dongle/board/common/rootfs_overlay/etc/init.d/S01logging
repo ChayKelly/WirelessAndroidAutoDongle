@@ -55,6 +55,21 @@ start() {
 
 stop() {
 	printf "Stopping logging: "
+	# Mark the boundary before syslogd goes away, so the next capture can tell a
+	# deliberate shutdown from the car yanking power.
+	#
+	# Without this the only signal is a run of NUL bytes at the boundary, which is
+	# the ext4 trace of blocks allocated for an append whose data never reached the
+	# disk. That heuristic is unreliable in both directions: the heartbeat's sync is
+	# bounded to ~45s, so a hard cut just after a sync leaves no NUL run at all, and
+	# a clean-looking boundary proves nothing. Eight drives in, "was that a crash or
+	# did I switch the car off" is still unanswerable, and it decides whether a boot
+	# count is a fault or just a journey.
+	#
+	# The sync matters as much as the marker: an unflushed marker is exactly as
+	# invisible as no marker.
+	logger -t boot "==== clean shutdown at uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s ====" 2>/dev/null
+	sync
 	start-stop-daemon -K -q -p /var/run/klogd.pid
 	start-stop-daemon -K -q -p /var/run/syslogd.pid
 	echo "OK"

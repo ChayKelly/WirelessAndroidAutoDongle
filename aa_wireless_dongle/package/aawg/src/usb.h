@@ -10,6 +10,11 @@ public:
     void switchToAccessoryGadget();
     void disableGadget();
 
+    // One-line snapshot of the USB gadget link, for logging next to a teardown.
+    // Static because it reads sysfs only and callers need it from the forwarding
+    // threads at the instant a transfer fails.
+    static std::string udcStatus();
+
 private:
     UsbManager();
     UsbManager(UsbManager const&);
@@ -19,5 +24,7 @@ private:
     void enableGadget(std::string name);
     void disableGadget(std::string name);
 
-    static std::string s_udcName; 
+    static std::string udcAttribute(const char* attribute);
+
+    static std::string s_udcName;
 };
