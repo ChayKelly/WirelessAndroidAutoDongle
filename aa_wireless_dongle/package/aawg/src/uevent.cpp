@@ -47,17 +47,45 @@ void UeventMonitor::monitorLoop(int nl_socket) {
             current += strlen(current) + 1;
         }
 
-        // Call the handlers
-        for (auto it = handlers.cbegin(); it != handlers.cend(); ++it) {
+        // Call the handlers.
+        //
+        // The list is moved out under the lock and the callbacks run unlocked. A handler
+        // runs arbitrary code (switchToAccessoryGadget(), completing a promise) and may
+        // itself call addHandler(), which would deadlock on a non-recursive mutex held
+        // across the call. Running unlocked also keeps addHandler() on the proxy thread
+        // from blocking behind a slow callback.
+        std::list<std::function<bool(UeventEnv)>> pending;
+        {
+            std::lock_guard<std::mutex> lock(handlersMutex);
+            pending.swap(handlers);
+        }
+
+        for (auto it = pending.begin(); it != pending.end(); ) {
+            // erase() already returns the following element, so only advance when the
+            // handler is kept. The previous version advanced again after erasing, which
+            // silently skipped the next handler, and incremented a returned end()
+            // iterator when the last handler removed itself, which is undefined
+            // behaviour. Every accessory wait registers a handler that removes itself,
+            // so this ran on a normal connection, not just an error path.
             if ((*it)(envMap)) {
-                it = handlers.erase(it);
+                it = pending.erase(it);
+            } else {
+                ++it;
             }
+        }
+
+        // Survivors go back at the front, so their relative order is preserved and any
+        // handler registered during the callbacks above stays behind them.
+        {
+            std::lock_guard<std::mutex> lock(handlersMutex);
+            handlers.splice(handlers.begin(), pending);
         }
     }
 }
 
 void UeventMonitor::addHandler(std::function<bool(UeventEnv)> handler) {
-    handlers.push_back(handler);
+    std::lock_guard<std::mutex> lock(handlersMutex);
+    handlers.push_back(std::move(handler));
 }
 
 std::optional<std::thread> UeventMonitor::start() {

@@ -2,6 +2,7 @@
 #include <thread>
 #include <list>
 #include <map>
+#include <mutex>
 #include <functional>
 
 typedef std::map<std::string, std::string> UeventEnv;
@@ -28,5 +29,8 @@ private:
 
     void monitorLoop(int nl_socket);
 
+    // Guards `handlers`. addHandler() is called from the proxy thread while the
+    // monitor thread is dispatching, so the list is shared across threads.
+    std::mutex handlersMutex;
     std::list<std::function<bool(UeventEnv)>> handlers;
 };
