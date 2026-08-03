@@ -68,10 +68,35 @@ stop() {
 	#
 	# The sync matters as much as the marker: an unflushed marker is exactly as
 	# invisible as no marker.
-	logger -t boot "==== clean shutdown at uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s ====" 2>/dev/null
+	#
+	# THE DELIVERY RACE, fixed 3 Aug 2026. `logger` only writes a datagram to
+	# /dev/log and returns. Nothing guaranteed syslogd had dequeued and written it
+	# before the kills below, so a perfectly clean shutdown could lose its own
+	# marker. That makes a missing marker prove nothing, which defeats the entire
+	# purpose: the marker exists so that its absence identifies a hard power cut.
+	# Found in the Codex adversarial review of Drive 9, where zero markers had been
+	# read as four hard power losses. Three things now guard it: a short delay
+	# before the kills, a check afterwards, and a direct append if syslog dropped it.
+	marker="==== clean shutdown at uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s ===="
+	logger -t boot "$marker" 2>/dev/null
+
+	# BusyBox syslogd writes each message as it is received, so the only gap is
+	# receipt. One second is ample and costs nothing here: the head unit holds USB
+	# power for minutes after ignition off.
+	sleep 1
 	sync
+
 	start-stop-daemon -K -q -p /var/run/klogd.pid
 	start-stop-daemon -K -q -p /var/run/syslogd.pid
+
+	# Last resort, now that syslogd is gone and nothing else holds the file. The
+	# suffix is deliberate: if this line ever appears in a capture it means the
+	# syslog path dropped the marker, which is itself worth knowing rather than
+	# silently papering over.
+	if ! tail -c 4096 "$LOGFILE" 2>/dev/null | grep -qF "$marker"; then
+		echo "$(date '+%b %e %H:%M:%S' 2>/dev/null) $(hostname 2>/dev/null) user.notice boot: $marker (written directly, syslog path dropped it)" >> "$LOGFILE" 2>/dev/null
+	fi
+	sync
 	echo "OK"
 }
 
