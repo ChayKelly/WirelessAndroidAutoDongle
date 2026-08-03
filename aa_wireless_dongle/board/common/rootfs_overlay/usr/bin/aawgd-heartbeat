@@ -19,19 +19,20 @@
 # Pick up AAWG_PROXY_PORT / an optional AAWG_HEARTBEAT_INTERVAL if configured.
 [ -r /etc/aawgd.conf ] && . /etc/aawgd.conf 2>/dev/null
 
-INTERVAL="${AAWG_HEARTBEAT_INTERVAL:-45}"
+INTERVAL="${AAWG_HEARTBEAT_INTERVAL:-8}"
 # A nonnumeric or zero interval would make sleep fail and spin the loop into a
-# tight logger+sync storm. Force it to a positive integer, else fall back to 45s.
+# tight logger+sync storm. Force it to a positive integer, else fall back to 8s.
 case "$INTERVAL" in
-	''|*[!0-9]*) INTERVAL=45 ;;
+	''|*[!0-9]*) INTERVAL=8 ;;
 esac
-[ "$INTERVAL" -ge 1 ] 2>/dev/null || INTERVAL=45
+[ "$INTERVAL" -ge 1 ] 2>/dev/null || INTERVAL=8
 
-# sync is decoupled from the tick rate. Diagnostic drives run the interval down
-# to 10s to make a track change visible (songs run three to four minutes, so 45s
-# cannot resolve one), and syncing every tick at that rate would be 4.5x the SD
-# card writes for no extra safety. Bounding it by elapsed time instead keeps the
-# worst-case log-tail loss where it has always been, about 45 seconds.
+# sync is decoupled from the tick rate. The default was 45s until 3 Aug 2026 and
+# is now 8s, because every diagnostic drive wants the finer resolution and four
+# captures in a row shipped at 45s through nobody remembering to set it. Syncing
+# every tick at 8s would be 5.6x the SD card writes for no extra safety, so it is
+# bounded by elapsed time instead, which keeps the worst-case log-tail loss where
+# it has always been, about 45 seconds.
 SYNC_INTERVAL=45
 
 WLAN=wlan0
@@ -113,8 +114,8 @@ THROTTLED_PATH=""
 powerprobed=0
 
 # Highest temperature seen this boot, in millidegrees. The peak matters more
-# than any single sample: at a 45s tick a hot soak is easy to sample either side
-# of, and this survives to the last line before power is cut.
+# than any single sample: at a coarse tick a hot soak is easy to sample either
+# side of, and this survives to the last line before power is cut.
 temp_max=""
 
 # Last-logged states, so the edge-triggered warnings below fire on a change
@@ -123,6 +124,54 @@ last_band=""
 last_uvolt=""
 last_throttled=""
 last_usb=""
+
+# UDC gap accounting, added 3 Aug 2026 off Drive 9.
+#
+# Measures how long the gadget spends away from `configured`. Drive 9 needed this
+# computed by hand from usb-state transitions to answer "how bad was that drive",
+# and it is the number that judges whether a cable swap worked.
+#
+# Named for exactly what it measures. It is NOT user-visible Android Auto downtime,
+# for three reasons worth remembering before quoting it: `configured` does not say
+# which gadget is bound, so the deliberate default-to-accessory switch can register
+# as a gap of a second or two; aawgd starts forwarding before the accessory gadget
+# reaches configured, so the session and the UDC state are not interchangeable; and
+# the 1s poll both quantises the ends and can miss a transition entirely.
+#
+# `gap_armed` stops the first enumeration after boot being counted as a gap, since
+# last_usb starts empty and the gadget is legitimately unconfigured until the head
+# unit turns up. It arms only after the gadget has reached configured once.
+gap_armed=0
+gap_start_cs=""
+gap_silent=0
+UP_CS=""
+UP_STR=""
+
+# Sets UP_CS (centiseconds) and UP_STR (the raw decimal string) from /proc/uptime.
+# Both empty if it could not be read.
+#
+# No command substitution, so this forks nothing: it runs on every USB transition
+# and once a second throughout a gap, and the whole point of the built-in `read`
+# in the poll below is that a drive costs no processes when nothing is happening.
+read_up() {
+	UP_CS=""
+	UP_STR=""
+	_u=""
+	read -r _u _ 2>/dev/null < /proc/uptime || return
+	[ -n "$_u" ] || return
+	UP_STR="$_u"
+	case "$_u" in
+		*.*) _s="${_u%.*}"; _f="${_u#*.}" ;;
+		*)   _s="$_u";      _f=0 ;;
+	esac
+	# Strip one leading zero so a fraction of "08" is decimal 8 rather than an
+	# invalid octal literal, which would abort the arithmetic in ash.
+	_f="${_f#0}"
+	[ -n "$_f" ] || _f=0
+	# Refuse anything non-numeric rather than let $(( )) fail in an unsupervised loop.
+	case "$_s$_f" in ''|*[!0-9]*) UP_CS=""; return ;; esac
+	UP_CS=$(( _s * 100 + _f ))
+}
 
 # The USB gadget's sysfs directory, resolved once. aawgd finds the same UDC by
 # taking the last entry in /sys/class/udc; there is exactly one on this hardware
@@ -221,10 +270,12 @@ resolve_power_paths() {
 	# nothing was, so an absence of usb-state lines during a drive cannot be read
 	# as "the USB link never changed".
 	#
-	# The interval is reported here too. It has now been left at the 45s default on
-	# three diagnostic drives in a row while the notes assumed 8s, and reading a
-	# capture at the wrong assumed resolution is worse than reading it at a known
-	# coarse one. This puts the answer in the first few lines of every boot.
+	# The interval is reported here too, and it earned its place immediately: it
+	# showed Drive 9 running at the old 45s default, the fourth diagnostic drive in
+	# a row to do so while the notes assumed 8s. That is what prompted moving the
+	# default to 8s on 3 Aug 2026. Keep the line regardless of the default, because
+	# reading a capture at the wrong assumed resolution is worse than reading it at
+	# a known coarse one, and the override still exists.
 	logger -t heartbeat-usb "interval=${INTERVAL}s syncinterval=${SYNC_INTERVAL}s"
 	if [ -n "$UDC_DIR" ]; then
 		logger -t heartbeat-usb "source udc=$UDC_DIR state=$(dash "$(cat "$UDC_DIR/state" 2>/dev/null)") speed=$(dash "$(cat "$UDC_DIR/current_speed" 2>/dev/null)")"
@@ -326,8 +377,8 @@ while true; do
 	# Sticky "has ever asserted this boot" flag for the under-voltage alarm.
 	#
 	# The alarm as read is an instantaneous state, so a sag shorter than the
-	# gap between two ticks is invisible: at a 45s interval that is most of a
-	# brownout. Temperature already carries a high-water mark for the same
+	# gap between two ticks is invisible, which at any realistic interval is
+	# most of a brownout. Temperature already carries a high-water mark for the same
 	# reason and voltage is the field that matters more here, so it gets one
 	# too. This is the local stand-in for the firmware's sticky throttle bits,
 	# which may not exist on this kernel at all.
@@ -454,8 +505,9 @@ while true; do
 	# Wait out the tick one second at a time, watching the USB gadget link on the
 	# way. This is the poll that catches the symptom Chay actually reports: Android
 	# Auto vanishing off the head unit and returning about ten seconds later, which
-	# is the gadget being torn down and re-enumerated. At the 45s tick that whole
-	# event fits between two samples and is invisible.
+	# is the gadget being torn down and re-enumerated. Even at the 8s tick that
+	# whole event can fit between two samples, and at the old 45s default it always
+	# did. Hence a dedicated 1s poll rather than relying on the tick.
 	#
 	# Edge triggered, so a stable link costs one comparison a second and logs
 	# nothing. Two values are worth having:
@@ -503,10 +555,44 @@ while true; do
 		[ -n "$usb_speed" ] || usb_speed="-"
 		usb_now="$usb_state/$usb_speed"
 
+		# Time spent with the host not even enumerating, sampled once a second for the
+		# duration of a gap. This is the discriminator Drive 9 turned up: every accessory
+		# wait that timed out sat at zero enumeration attempts, while the one that
+		# succeeded after 23 seconds had the host retrying every ~340ms throughout. A
+		# gap that is mostly silent is a dead link; a gap that is mostly enumerating is
+		# a slow recovery that would still have completed.
+		if [ -n "$gap_start_cs" ] && [ "$usb_state" != "configured" ]; then
+			case "$usb_speed" in
+				UNKNOWN|-) gap_silent=$((gap_silent + 1)) ;;
+			esac
+		fi
+
 		if [ "$usb_now" != "$last_usb" ]; then
 			# Uptime is re-read here rather than reused from the tick above, so the
 			# transition carries its own timestamp instead of the tick's.
-			logger -t usb-state "up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)s $(dash "$last_usb") -> $usb_now"
+			read_up
+			logger -t usb-state "up=$(dash "$UP_STR")s $(dash "$last_usb") -> $usb_now"
+
+			if [ "$usb_state" = "configured" ]; then
+				# Close an open gap. Guarded on UP_CS so an unreadable /proc/uptime
+				# drops the measurement rather than logging a nonsense duration.
+				if [ -n "$gap_start_cs" ] && [ -n "$UP_CS" ]; then
+					_g=$(( UP_CS - gap_start_cs ))
+					if [ "$_g" -ge 0 ]; then
+						_gs=$(( _g / 100 ))
+						_gc=$(( _g % 100 ))
+						[ "$_gc" -ge 10 ] || _gc="0$_gc"
+						logger -t udc-gap "up=$(dash "$UP_STR")s unconfigured for ${_gs}.${_gc}s (host silent ${gap_silent}s of it) -> $usb_now"
+					fi
+				fi
+				gap_start_cs=""
+				gap_silent=0
+				gap_armed=1
+			elif [ "$gap_armed" = 1 ] && [ -z "$gap_start_cs" ] && [ -n "$UP_CS" ]; then
+				gap_start_cs="$UP_CS"
+				gap_silent=0
+			fi
+
 			last_usb="$usb_now"
 		fi
 	done
