@@ -9,14 +9,10 @@
 #include "bluetoothProfiles.h"
 #include "bluetoothAdvertisement.h"
 
-// Escalation thresholds, counted in consecutive failed retry rounds 20s apart.
-//
-// A device that claims to be Connected but whose profile will not complete is stale bluez
-// state, and power cycling the controller can genuinely clear that, so escalate quickly.
-// A device that is simply not connected usually means the phone is away, asleep, or has
-// stopped accepting connections, and no amount of resetting the local controller can make
-// a remote device answer. That case escalates slowly, as a long shot rather than a fix.
-static constexpr int STALE_FAILURES_BEFORE_ADAPTER_RESET = 3;
+// Escalation threshold, counted in consecutive failed retry rounds 20s apart. A device that
+// is simply not connected usually means the phone is away, asleep, or has stopped accepting
+// connections, and no amount of resetting the local controller can make a remote device
+// answer. Escalate slowly, as a long shot rather than a fix.
 static constexpr int ABSENT_FAILURES_BEFORE_ADAPTER_RESET = 12;
 
 // Each reset doubles the threshold up to this ceiling (8 minutes at a 20s retry). Without
@@ -299,7 +295,6 @@ BluetoothHandler::ConnectResult BluetoothHandler::connectDevice() {
 
     const bool isDongleMode = (Config::instance()->getConnectionStrategy() == ConnectionStrategy::DONGLE_MODE);
     bool anyConnected = false;
-    bool anyClaimedConnected = false;
 
     Logger::instance()->info("Found %d bluetooth devices\n", device_paths.size());
 
@@ -312,7 +307,6 @@ BluetoothHandler::ConnectResult BluetoothHandler::connectDevice() {
         try {
             std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, device_path);
             DBus::MethodProxy connectProfile = *(bluezDevice->create_method<void(std::string)>(INTERFACE_BLUEZ_DEVICE, "ConnectProfile"));
-            DBus::MethodProxy disconnect = *(bluezDevice->create_method<void()>(INTERFACE_BLUEZ_DEVICE, "Disconnect"));
 
             std::shared_ptr<DBus::PropertyProxy<bool>> deviceConnected = bluezDevice->create_property<bool>(INTERFACE_BLUEZ_DEVICE, "Connected");
 
@@ -329,15 +323,14 @@ BluetoothHandler::ConnectResult BluetoothHandler::connectDevice() {
                 }
             }
 
-            // Logged because it is the one fact that says whether a failure to connect is a
-            // phone that has gone away or bluez holding a device object that is already dead.
-            // No capture before now recorded it, so the escalation below is calibrated blind.
             Logger::instance()->info("Bluetooth device reports connected=%s\n", alreadyConnected ? "yes" : "no");
 
+            // A connected ACL is the live phone bringing up wifi, not stale bluez state.
+            // Drive 10 showed the 20-second retry repeatedly tearing down that handshake,
+            // so leave the phone and every profile on its ACL alone.
             if (alreadyConnected) {
-                anyClaimedConnected = true;
-                Logger::instance()->info("Bluetooth device already connected, disconnecting\n");
-                disconnect();
+                Logger::instance()->info("Bluetooth device already connected, leaving it alone\n");
+                return ConnectResult::Connected;
             }
             connectProfile(isDongleMode ? "" : HSP_AG_UUID);
             Logger::instance()->info("Bluetooth connected to the device\n");
@@ -370,7 +363,30 @@ BluetoothHandler::ConnectResult BluetoothHandler::connectDevice() {
         return ConnectResult::Connected;
     }
 
-    return anyClaimedConnected ? ConnectResult::Wedged : ConnectResult::Unreachable;
+    return ConnectResult::Unreachable;
+}
+
+void BluetoothHandler::disconnectDevice() {
+    DBus::ManagedObjects objects;
+    if (!getBluezObjects(objects)) {
+        return;
+    }
+
+    for (auto const& [path, interfaces]: objects) {
+        for (auto const& [interface, properties]: interfaces) {
+            if (interface != INTERFACE_BLUEZ_DEVICE) {
+                continue;
+            }
+
+            if (dbusTry("Device.Disconnect", [&] {
+                std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, path);
+                DBus::MethodProxy disconnect = *(bluezDevice->create_method<void()>(INTERFACE_BLUEZ_DEVICE, "Disconnect"));
+                disconnect();
+            })) {
+                Logger::instance()->info("Bluetooth device disconnected by the 90s watchdog\n");
+            }
+        }
+    }
 }
 
 void BluetoothHandler::resetAdapter(int attempts) {
@@ -395,14 +411,33 @@ void BluetoothHandler::resetAdapter(int attempts) {
 }
 
 void BluetoothHandler::retryConnectLoop() {
-    bool should_exit = false;
     int consecutiveFailures = 0;
-    int staleThreshold = STALE_FAILURES_BEFORE_ADAPTER_RESET;
     int absentThreshold = ABSENT_FAILURES_BEFORE_ADAPTER_RESET;
     const bool isDongleMode = (Config::instance()->getConnectionStrategy() == ConnectionStrategy::DONGLE_MODE);
-    std::future<void> connectWithRetryFuture = connectWithRetryPromise->get_future();
+    bool quietPeriodLogged = false;
 
-    while (!should_exit) {
+    while (!stopRequested()) {
+        bool handshakeQuietPeriod = false;
+        {
+            std::lock_guard<std::mutex> lock(m_retryMutex);
+            const auto quietPeriodEnd = m_handshakeEnded + std::chrono::seconds(60);
+            handshakeQuietPeriod = m_handshakeInProgress.load() ||
+                (m_handshakeEnded != std::chrono::steady_clock::time_point{} &&
+                 std::chrono::steady_clock::now() < quietPeriodEnd);
+        }
+
+        if (handshakeQuietPeriod) {
+            if (!quietPeriodLogged) {
+                Logger::instance()->info("Bluetooth handshake in progress or settling, not paging the phone\n");
+                quietPeriodLogged = true;
+            }
+            if (waitForStop(std::chrono::seconds(20))) {
+                break;
+            }
+            continue;
+        }
+        quietPeriodLogged = false;
+
         ConnectResult result = ConnectResult::NoDevices;
 
         // connectDevice talks to bluez before it reaches its own per-device try, so a throw
@@ -416,32 +451,40 @@ void BluetoothHandler::retryConnectLoop() {
             Logger::instance()->info("Bluetooth connect attempt threw an unknown exception\n");
         }
 
-        // Waiting for a phone to appear at all is the normal state at boot and must never
-        // trigger a reset, which is why NoDevices is not counted here.
-        int threshold = 0;
-        if (result == ConnectResult::Wedged) {
-            threshold = staleThreshold;
-        } else if (result == ConnectResult::Unreachable) {
-            threshold = absentThreshold;
+        // ConnectProfile can remain blocked after accept() has stopped the loop. Do not
+        // count that completed call or reset the adapter underneath the live session.
+        if (stopRequested()) {
+            break;
         }
 
-        if (threshold > 0 && !isDongleMode) {
-            if (++consecutiveFailures >= threshold) {
+        if (result == ConnectResult::Connected) {
+            consecutiveFailures = 0;
+            Logger::instance()->info("Bluetooth connected, waiting up to 90s for the phone's TCP connection\n");
+            if (waitForStop(std::chrono::seconds(90))) {
+                break;
+            }
+            Logger::instance()->info("No TCP connection 90s after the bluetooth connect, disconnecting the phone and paging again\n");
+            disconnectDevice();
+            continue;
+        }
+
+        // Waiting for a phone to appear at all is the normal state at boot and must never
+        // trigger a reset, which is why NoDevices is not counted here.
+        if (result == ConnectResult::Unreachable && !isDongleMode) {
+            if (++consecutiveFailures >= absentThreshold) {
                 resetAdapter(consecutiveFailures);
                 consecutiveFailures = 0;
 
-                // Back off both thresholds, so a phone that is simply not there cannot hold
-                // the adapter in a power cycle every minute for the rest of the drive.
-                staleThreshold = std::min(staleThreshold * 2, MAX_FAILURES_BEFORE_ADAPTER_RESET);
+                // Back off the threshold, so a phone that is simply not there cannot hold
+                // the adapter in repeated power cycles for the rest of the drive.
                 absentThreshold = std::min(absentThreshold * 2, MAX_FAILURES_BEFORE_ADAPTER_RESET);
             }
         } else {
             consecutiveFailures = 0;
         }
 
-        if (connectWithRetryFuture.wait_for(std::chrono::seconds(20)) == std::future_status::ready) {
-            should_exit = true;
-            connectWithRetryPromise = nullptr;
+        if (waitForStop(std::chrono::seconds(20))) {
+            break;
         }
     }
 
@@ -516,14 +559,41 @@ std::optional<std::thread> BluetoothHandler::connectWithRetry() {
         return std::nullopt;
     }
 
-    connectWithRetryPromise = std::make_shared<std::promise<void>>();
+    {
+        std::lock_guard<std::mutex> lock(m_retryMutex);
+        m_stopRequested = false;
+    }
     return std::thread(&BluetoothHandler::retryConnectLoop, this);
 }
 
 void BluetoothHandler::stopConnectWithRetry() {
-    if (connectWithRetryPromise) {
-        connectWithRetryPromise->set_value();
+    {
+        std::lock_guard<std::mutex> lock(m_retryMutex);
+        m_stopRequested = true;
     }
+    m_retryCondition.notify_all();
+}
+
+void BluetoothHandler::handshakeStarted() {
+    m_handshakeInProgress.store(true);
+}
+
+void BluetoothHandler::handshakeEnded() {
+    std::lock_guard<std::mutex> lock(m_retryMutex);
+    m_handshakeEnded = std::chrono::steady_clock::now();
+    m_handshakeInProgress.store(false);
+}
+
+bool BluetoothHandler::stopRequested() {
+    std::lock_guard<std::mutex> lock(m_retryMutex);
+    return m_stopRequested;
+}
+
+bool BluetoothHandler::waitForStop(std::chrono::seconds timeout) {
+    std::unique_lock<std::mutex> lock(m_retryMutex);
+    return m_retryCondition.wait_for(lock, timeout, [this] {
+        return m_stopRequested;
+    });
 }
 
 void BluetoothHandler::powerOff() {

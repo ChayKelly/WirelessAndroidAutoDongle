@@ -41,7 +41,7 @@ public:
 
         // Set timeouts so a stalled handshake cannot block us indefinitely
         struct timeval tv = {
-            .tv_sec = 20,
+            .tv_sec = 60,
             .tv_usec = 0,
         };
         setsockopt(m_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -59,9 +59,9 @@ public:
         // Newer Android Auto versions do not always send handshake messages in a fixed
         // order and can interleave other messages (e.g. pings). Dispatch on message id in
         // a loop instead of aborting on anything unexpected.
-        // This runs on the DBus dispatcher thread, so bound the whole handshake with a
-        // deadline in addition to the per-read timeout.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+        // The phone keeps this channel open until its TCP connection is accepted and closes
+        // it itself. Give wifi join and DHCP enough time; closing it early only hurts setup.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
         bool wifiInfoSent = false;
         for (int i = 0; i < 32 && std::chrono::steady_clock::now() < deadline; i++) {
             MessageId messageId = ReadMessage();
@@ -266,6 +266,13 @@ namespace {
     private:
         int m_fd;
     };
+
+    class HandshakeEndGuard {
+    public:
+        ~HandshakeEndGuard() {
+            BluetoothHandler::instance().handshakeEnded();
+        }
+    };
 }
 
 #pragma region AAWirelessProfile
@@ -278,7 +285,7 @@ void AAWirelessProfile::NewConnection(DBus::Path path, std::shared_ptr<DBus::Fil
     Logger::instance()->info("Path: %s, fd: %d\n", path.c_str(), fd->descriptor());
 
     // bluez times out this DBus method call after 25 seconds and tears the profile down,
-    // while the handshake below is allowed up to 45. Blocking here made bluez log NoReply
+    // while the handshake below is allowed up to 120. Blocking here made bluez log NoReply
     // on every session, so reply immediately and hand the handshake to a worker thread.
     // The descriptor belongs to the incoming DBus message, which closes it once this
     // method returns, so the worker gets its own dup() to own and close.
@@ -288,9 +295,11 @@ void AAWirelessProfile::NewConnection(DBus::Path path, std::shared_ptr<DBus::Fil
         return;
     }
 
+    BluetoothHandler::instance().handshakeStarted();
     try {
         std::thread([launcherFd]() {
             ScopedFd ownedFd(launcherFd);
+            HandshakeEndGuard handshakeEndGuard;
 
             try {
                 AAWirelessLauncher(ownedFd.get()).launch();
@@ -307,6 +316,7 @@ void AAWirelessProfile::NewConnection(DBus::Path path, std::shared_ptr<DBus::Fil
     catch (const std::exception& e) {
         Logger::instance()->info("Failed to start bluetooth handshake thread: %s\n", e.what());
         close(launcherFd);
+        BluetoothHandler::instance().handshakeEnded();
     }
 }
 

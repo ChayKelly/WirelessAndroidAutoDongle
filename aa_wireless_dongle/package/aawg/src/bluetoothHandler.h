@@ -1,5 +1,9 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -31,13 +35,14 @@ public:
 
     std::optional<std::thread> connectWithRetry();
     void stopConnectWithRetry();
+    void handshakeStarted();
+    void handshakeEnded();
 
 private:
     enum class ConnectResult {
         NoDevices,    // nothing known to connect to yet, so nothing has failed
         Connected,
         Unreachable,  // known device, not connected, would not connect: phone is away or asleep
-        Wedged,       // device claims Connected but the profile will not complete: stale bluez state
     };
 
     BluetoothHandler() {};
@@ -55,14 +60,21 @@ private:
     bool setPairable(bool pairable);
     bool exportProfiles();
     ConnectResult connectDevice();
+    void disconnectDevice();
     void resetAdapter(int attempts);
 
     bool startAdvertising();
     void stopAdvertising();
 
     void retryConnectLoop();
+    bool stopRequested();
+    bool waitForStop(std::chrono::seconds timeout);
 
-    std::shared_ptr<std::promise<void>> connectWithRetryPromise;
+    std::mutex m_retryMutex;
+    std::condition_variable m_retryCondition;
+    bool m_stopRequested = false;
+    std::atomic<bool> m_handshakeInProgress{false};
+    std::chrono::steady_clock::time_point m_handshakeEnded;
 
     std::shared_ptr<DBus::Dispatcher> m_dispatcher;
     std::shared_ptr<DBus::Connection> m_connection;
