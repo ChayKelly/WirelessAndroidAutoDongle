@@ -1,8 +1,15 @@
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <algorithm>
+#include <chrono>
 #include <future>
+#include <memory>
+#include <thread>
 
 #include "common.h"
 #include "uevent.h"
@@ -10,6 +17,36 @@
 
 constexpr const char* defaultGadgetName = "default";
 constexpr const char* accessoryGadgetName = "accessory";
+
+static bool phoneHasGone(int fd) {
+    struct pollfd pollFd;
+    pollFd.fd = fd;
+    pollFd.events = POLLIN;
+    pollFd.revents = 0;
+
+    if (poll(&pollFd, 1, 0) <= 0) {
+        return false;
+    }
+
+    if (pollFd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+        return true;
+    }
+
+    if (pollFd.revents & POLLIN) {
+        char byte;
+        // The phone's first Android Auto frame may legitimately already be in
+        // the socket buffer, so only peek at it while checking for an EOF.
+        ssize_t len = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (len == 0) {
+            return true;
+        }
+        if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 /*static*/ std::string UsbManager::s_udcName;
 
@@ -134,7 +171,7 @@ void UsbManager::disableGadget() {
     Logger::instance()->info("USB Manager: Disabled all USB gadgets\n");
 }
 
-bool UsbManager::enableDefaultAndWaitForAccessory(std::chrono::milliseconds timeout) {
+bool UsbManager::enableDefaultAndWaitForAccessory(std::chrono::milliseconds timeout, int tcp_fd) {
     std::shared_ptr<std::promise<void>> accessoryPromise = std::make_shared<std::promise<void>>();
     std::weak_ptr<std::promise<void>> accessoryPromiseWeak = accessoryPromise;
 
@@ -162,21 +199,65 @@ bool UsbManager::enableDefaultAndWaitForAccessory(std::chrono::milliseconds time
         return true;
     });
 
+    std::future<void> accessoryFuture = accessoryPromise->get_future();
+
     enableGadget(defaultGadgetName);
 
     Logger::instance()->info("USB Manager: Enabled default gadget\n");
 
     if (timeout == std::chrono::milliseconds(0)) {
-        accessoryPromise->get_future().wait();
+        accessoryFuture.wait();
         return true;
-    } else {
-        std::future_status status = accessoryPromise->get_future().wait_for(timeout);
+    }
 
-        if (status == std::future_status::ready) {
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + timeout;
+    int silentFor = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (accessoryFuture.wait_for(std::chrono::seconds(1)) == std::future_status::ready) {
             return true;
-        } else {
-            Logger::instance()->info("USB Manager: Timeout waiting for accessory start request\n");
+        }
+
+        if (tcp_fd >= 0 && phoneHasGone(tcp_fd)) {
+            Logger::instance()->info("USB Manager: phone closed its connection while waiting for the accessory, giving up\n");
             return false;
         }
+
+        silentFor += 1;
+        if (silentFor >= 10 && udcAttribute("current_speed") == "UNKNOWN") {
+            Logger::instance()->info("USB Manager: host silent for %ds, re-presenting the default gadget\n", silentFor);
+            disableGadget(defaultGadgetName);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            enableGadget(defaultGadgetName);
+            silentFor = 0;
+        }
+    }
+
+    Logger::instance()->info("USB Manager: Timeout waiting for accessory start request\n");
+    return false;
+}
+
+bool UsbManager::waitForAccessoryConfigured(std::chrono::milliseconds timeout) {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point deadline = start + timeout;
+    std::string state;
+
+    while (true) {
+        state = udcAttribute("state");
+        if (state == "configured") {
+            long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            Logger::instance()->info("USB Manager: accessory gadget configured after %lldms\n", elapsed);
+            return true;
+        }
+
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+            Logger::instance()->info("USB Manager: accessory gadget not configured after %lldms (state=%s), continuing\n", elapsed, state.c_str());
+            return false;
+        }
+
+        std::chrono::milliseconds remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        std::this_thread::sleep_for(std::min(std::chrono::milliseconds(100), remaining));
     }
 }

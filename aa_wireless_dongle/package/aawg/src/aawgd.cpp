@@ -123,6 +123,13 @@ int main(void) {
 
         UsbManager::instance().disableGadget();
 
+        if (proxy.endedOnUsbError()) {
+            // Drive 10 boots 46 and 50 logged dwc2 FIFO flush HANG! messages
+            // followed by a reset storm or an accessory that never configured.
+            Logger::instance()->info("USB link failed, settling the controller for 3s before re-presenting the gadget\n");
+            sleep(3);
+        }
+
         if (connectionStrategy != ConnectionStrategy::DONGLE_MODE) {
             // sleep for a couple of seconds before retrying
             sleep(2);

@@ -161,6 +161,9 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
             // one moment worth measuring it: "not-attached" means VBUS went away,
             // anything else means it held and the data path failed instead.
             Logger::instance()->info("Teardown: read from %s failed: %s [%s]\n", read_name.c_str(), teardownReason(read_errno), UsbManager::udcStatus().c_str());
+            if (read_name == "USB") {
+                m_usb_error = true;
+            }
             break;
         }
         else if (len == 0) {
@@ -188,6 +191,9 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
                 break;
             }
             Logger::instance()->info("Teardown: write to %s failed: %s [%s]\n", write_name.c_str(), teardownReason(write_errno), UsbManager::udcStatus().c_str());
+            if (write_name == "USB") {
+                m_usb_error = true;
+            }
             break;
         }
         else if (should_exit) {
@@ -204,6 +210,10 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
     }
 
     stopForwarding(should_exit);
+}
+
+bool AAWProxy::endedOnUsbError() const {
+    return m_usb_error.load();
 }
 
 // A session that stops carrying data without dropping is invisible to everything
@@ -308,19 +318,33 @@ void AAWProxy::handleClient(int server_sock) {
 
     close(server_sock);
 
+    struct TcpSocketGuard {
+        int& fd;
+
+        ~TcpSocketGuard() {
+            if (fd >= 0) {
+                shutdown(fd, SHUT_RDWR);
+                close(fd);
+                fd = -1;
+            }
+        }
+    } tcpSocketGuard{m_tcp_fd};
+
     Logger::instance()->info("Tcp server accepted connection\n");
 
     // Phone connected via TCP, we can stop retrying bluetooth connection
     BluetoothHandler::instance().stopConnectWithRetry();
 
     if (Config::instance()->getConnectionStrategy() != ConnectionStrategy::USB_FIRST) {
-        if (!UsbManager::instance().enableDefaultAndWaitForAccessory(std::chrono::seconds(30))) {
+        if (!UsbManager::instance().enableDefaultAndWaitForAccessory(std::chrono::seconds(120), m_tcp_fd)) {
             // Drive 8 hit this three times. The gadget state says whether the head
             // unit ignored an enumerated device or never enumerated one at all.
-            Logger::instance()->info("Teardown: usb accessory did not connect within 30s [%s]\n", UsbManager::udcStatus().c_str());
+            Logger::instance()->info("Teardown: usb accessory did not connect within 120s [%s]\n", UsbManager::udcStatus().c_str());
             return;
         }
     }
+
+    UsbManager::instance().waitForAccessoryConfigured(std::chrono::seconds(10));
 
     Logger::instance()->info("Opening usb accessory\n");
     if ((m_usb_fd = open("/dev/usb_accessory", O_RDWR)) < 0) {
@@ -436,9 +460,6 @@ void AAWProxy::handleClient(int server_sock) {
     close(m_usb_fd);
     m_usb_fd = -1;
 
-    close(m_tcp_fd);
-    m_tcp_fd = -1;
-
     // One line per session, so a drive can be read as "how long did each session
     // last and how much did it actually carry" without deriving it from the wlan0
     // counters. Sessions that ran their whole life below the healthy floor, as the
@@ -473,6 +494,7 @@ std::optional<std::thread> AAWProxy::startServer(int32_t port) {
     int opt = 1;
     if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
         Logger::instance()->info("setsockopt failed: %s\n", strerror(errno));
+        close(server_sock);
         return std::nullopt;
     }
 
@@ -483,11 +505,13 @@ std::optional<std::thread> AAWProxy::startServer(int32_t port) {
 
     if (bind(server_sock, (struct sockaddr*)&address, sizeof(address)) < 0) {
         Logger::instance()->info("bind failed: %s\n", strerror(errno));
+        close(server_sock);
         return std::nullopt;
     }
 
     if (listen(server_sock, 3) < 0) {
         Logger::instance()->info("listen failed: %s\n", strerror(errno));
+        close(server_sock);
         return std::nullopt;
     }
 

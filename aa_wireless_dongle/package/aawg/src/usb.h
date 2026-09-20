@@ -6,7 +6,8 @@ public:
     static UsbManager& instance();
 
     void init();
-    bool enableDefaultAndWaitForAccessory(std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
+    bool enableDefaultAndWaitForAccessory(std::chrono::milliseconds timeout = std::chrono::milliseconds(0), int tcp_fd = -1);
+    bool waitForAccessoryConfigured(std::chrono::milliseconds timeout);
     void switchToAccessoryGadget();
     void disableGadget();
 

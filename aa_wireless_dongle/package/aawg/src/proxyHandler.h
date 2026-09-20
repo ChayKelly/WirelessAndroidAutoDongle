@@ -9,6 +9,7 @@
 class AAWProxy {
 public:
     std::optional<std::thread> startServer(int32_t port);
+    bool endedOnUsbError() const;
 
 private:
     enum class ProxyDirection {
@@ -37,6 +38,7 @@ private:
     std::optional<std::thread> m_monitor_thread = std::nullopt;
 
     std::atomic<bool> m_log_communication = false;
+    std::atomic<bool> m_usb_error{false};
 
     // Bytes successfully forwarded this session, split by direction.
     //
