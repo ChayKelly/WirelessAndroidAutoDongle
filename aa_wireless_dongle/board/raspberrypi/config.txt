@@ -24,3 +24,13 @@ dtparam=krnbt=on
 
 # Enable dwc2 required for gadget mode
 dtoverlay=dwc2,dr_mode=peripheral
+
+# Hold the ARM clock at its rated speed instead of letting it idle at 600MHz.
+# Drive 10 (20 Sep 2026) read freq=600M on all 4,815 heartbeat samples, including
+# sessions carrying 600 kB/s through dwc2 and the wifi, so the governor never
+# raised it under load. The proxy, the USB interrupt path and hostapd all share
+# that clock, and every cycle it loses is jitter on the audio. Costs nothing on a
+# board that peaks at 53C (no throttling or under-voltage recorded on any drive).
+# arm_freq_min rather than force_turbo: it leaves the firmware's thermal limits
+# in place and does not set the warranty bit.
+arm_freq_min=1000
